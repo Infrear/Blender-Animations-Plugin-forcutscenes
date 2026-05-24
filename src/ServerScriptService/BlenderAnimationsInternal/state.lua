@@ -9,7 +9,7 @@ local Computed = Fusion.Computed
 
 local State = {
     activeTab = Value("Player"),
-	tabs = Value({ "Player", "Rigging", "Blender Sync", "Tools", "More" }),
+	tabs = Value({ "Player", "Rigging", "Tools", "More" }),
 	draggedTab = Value(nil),
 	dropIndex = Value(nil),
 	dockSide = Value(Enum.InitialDockState.Left),
@@ -111,6 +111,12 @@ local State = {
     showDebugInfo = Value(true),
     reducedMotion = Value(false),
     exportWelds = Value(true),
+    
+    -- Animation simplifier
+    simplifierEnabled = Value(false),
+    simplifierStrength = Value(15),
+    lastRawAnimData = Value(nil :: any?),
+    currentAnimationData = Value(nil :: any?),
     
     -- Toolbar button image
     toolbarButtonImage = Value("rbxassetid://116041192227009"),

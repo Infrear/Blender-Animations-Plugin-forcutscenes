@@ -24,12 +24,17 @@ return function()
 					end
 				end,
 
-				RequestAsync = function(self, _)
+				RequestAsync = function(self, request)
+					self._lastRequest = request
 					if self._requestAsyncShouldSucceed then
 						return self._requestAsyncResponse
 					else
 						error("Mock HttpService: RequestAsync failed")
 					end
+				end,
+
+				UrlEncode = function(self, value)
+					return tostring(value):gsub(" ", "%%20")
 				end,
 
 				JSONDecode = function(self, _)
@@ -89,6 +94,24 @@ return function()
 				}
 				local result = connection:ImportAnimation(1337, "TestArmature")
 				expect(result).to.equal("animation_data_body")
+			end)
+
+			it("should post target rest calibration when provided", function()
+				mockHttpService._requestAsyncResponse = {
+					Success = true,
+					Body = "animation_data_body",
+				}
+
+				local result = connection:ImportAnimation(1337, "Test Armature", {
+					bones = {
+						Child = { distance = 5 },
+					},
+				})
+
+				expect(result).to.equal("animation_data_body")
+				expect(mockHttpService._lastRequest.Method).to.equal("POST")
+				expect(mockHttpService._lastRequest.Url).to.equal("http://localhost:1337/export_animation/Test%20Armature")
+				expect(mockHttpService._lastRequest.Body).to.equal("encoded_json")
 			end)
 
 			it("should return nil if RequestAsync pcall fails", function()

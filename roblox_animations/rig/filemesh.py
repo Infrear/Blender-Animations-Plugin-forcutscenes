@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import ctypes
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import gzip
 import importlib
 import json
 from pathlib import Path
+import random
 import re
 import struct
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -18,6 +22,11 @@ from typing import Dict, List, Optional, Tuple
 
 _FILEMESH_CACHE: Dict[str, dict] = {}
 _FILEMESH_BYTES_CACHE: Dict[str, bytes] = {}
+
+_HTTP_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
+_HTTP_MAX_RETRIES = 3
+_HTTP_BASE_RETRY_DELAY_SECONDS = 0.5
+_HTTP_MAX_RETRY_DELAY_SECONDS = 8.0
 
 _BONE_STRUCT = struct.Struct("<IHHf9f3f")
 _SUBSET_STRUCT = struct.Struct("<IIIII26H")
@@ -28,10 +37,12 @@ _THREE_POSE_CORRECTIVE_STRUCT = struct.Struct("<HHH")
 _FACE_STRUCT = struct.Struct("<III")
 _SKINNING_STRUCT = struct.Struct("<4B4B")
 _FACS_TRANSFORM_CHANNELS = ("px", "py", "pz", "rx", "ry", "rz")
+_GLTF_COMPONENT_TYPE_UINT8 = 5121
 _GLTF_COMPONENT_TYPE_UINT32 = 5125
 _GLTF_COMPONENT_TYPE_FLOAT32 = 5126
 _DRACO_DLL_UNINITIALIZED = object()
 _DRACO_DLL = _DRACO_DLL_UNINITIALIZED
+_DRACO_LOAD_ERROR = None
 
 _FILEMESH_FACS_CONTROL_MAP = {
     "c_COR": "Corrugator",
@@ -525,6 +536,44 @@ def _require_online_access(action: str) -> None:
         )
 
 
+def _retry_after_delay_seconds(headers) -> Optional[float]:
+    if not headers:
+        return None
+
+    value = headers.get("Retry-After")
+    if not value:
+        return None
+
+    value = str(value).strip()
+    try:
+        return max(0.0, min(float(value), _HTTP_MAX_RETRY_DELAY_SECONDS))
+    except ValueError:
+        pass
+
+    try:
+        retry_at = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    delay = (retry_at - datetime.now(timezone.utc)).total_seconds()
+    return max(0.0, min(delay, _HTTP_MAX_RETRY_DELAY_SECONDS))
+
+
+def _http_retry_delay_seconds(headers, attempt_index: int) -> float:
+    retry_after = _retry_after_delay_seconds(headers)
+    if retry_after is not None:
+        return retry_after
+
+    exponential = min(
+        _HTTP_BASE_RETRY_DELAY_SECONDS * (2 ** attempt_index),
+        _HTTP_MAX_RETRY_DELAY_SECONDS,
+    )
+    jitter = random.uniform(0.0, min(0.25, exponential * 0.25))
+    return min(exponential + jitter, _HTTP_MAX_RETRY_DELAY_SECONDS)
+
+
 def _fetch_url_response(
     url: str,
     timeout: float = 15.0,
@@ -545,15 +594,32 @@ def _fetch_url_response(
         if follow_redirects
         else urllib.request.build_opener(_NoRedirectHandler())
     )
-    with opener.open(request, timeout=timeout) as response:
-        data = response.read()
-        encoding = (response.headers.get("Content-Encoding") or "").lower()
-        if "gzip" in encoding or data.startswith(b"\x1f\x8b"):
+    for attempt_index in range(_HTTP_MAX_RETRIES + 1):
+        try:
+            with opener.open(request, timeout=timeout) as response:
+                data = response.read()
+                encoding = (response.headers.get("Content-Encoding") or "").lower()
+                if "gzip" in encoding or data.startswith(b"\x1f\x8b"):
+                    try:
+                        data = gzip.decompress(data)
+                    except OSError:
+                        pass
+                return response, data
+        except urllib.error.HTTPError as exc:
+            can_retry = (
+                exc.code in _HTTP_RETRY_STATUS_CODES
+                and attempt_index < _HTTP_MAX_RETRIES
+            )
+            if not can_retry:
+                raise
+            delay = _http_retry_delay_seconds(exc.headers, attempt_index)
             try:
-                data = gzip.decompress(data)
-            except OSError:
+                exc.close()
+            except Exception:
                 pass
-        return response, data
+            time.sleep(delay)
+
+    raise RuntimeError(f"failed to fetch url after retries: {url}")
 
 
 def _fetch_url_bytes(
@@ -845,19 +911,63 @@ def _read_vertex_records(data: bytes, offset: int, num_verts: int, vertex_size: 
     unpack_position = struct.unpack_from
     has_normal = vertex_size >= 24
     has_uv = vertex_size >= 32
+    has_tangent = vertex_size >= 36
+    has_color = vertex_size >= 40
     for _ in range(num_verts):
         position = unpack_position("<3f", data, offset)
         normal = unpack_position("<3f", data, offset + 12) if has_normal else None
         uv = unpack_position("<2f", data, offset + 24) if has_uv else None
+        tangent_bytes = unpack_position("<4B", data, offset + 32) if has_tangent else None
+        color_bytes = unpack_position("<4B", data, offset + 36) if has_color else None
         vertices_append(
             {
                 "position": position,
                 "normal": normal,
                 "uv": uv,
+                "tangent": _decode_tangent_bytes(tangent_bytes),
+                "tangent_bytes": tangent_bytes,
+                "tangent_sign": _decode_tangent_sign(tangent_bytes),
+                "tangent_sign_byte": tangent_bytes[3] if tangent_bytes is not None else None,
+                "color": _decode_color_bytes(color_bytes),
+                "color_bytes": color_bytes,
             }
         )
         offset += vertex_size
     return vertices, offset
+
+
+def _decode_tangent_bytes(tangent_bytes) -> Optional[Tuple[float, float, float, float]]:
+    if tangent_bytes is None or len(tangent_bytes) < 4:
+        return None
+
+    x = (float(tangent_bytes[0]) / 127.0) - 1.0
+    y = (float(tangent_bytes[1]) / 127.0) - 1.0
+    z = (float(tangent_bytes[2]) / 127.0) - 1.0
+    sign = _decode_tangent_sign(tangent_bytes)
+    magnitude = ((x * x) + (y * y) + (z * z)) ** 0.5
+    if magnitude <= 1e-6 or abs(magnitude - 1.0) > 0.15:
+        return None
+
+    inverse_magnitude = 1.0 / magnitude
+    return (
+        x * inverse_magnitude,
+        y * inverse_magnitude,
+        z * inverse_magnitude,
+        sign if sign is not None else 1.0,
+    )
+
+
+def _decode_tangent_sign(tangent_bytes) -> Optional[float]:
+    if tangent_bytes is None or len(tangent_bytes) < 4:
+        return None
+    sign = (float(tangent_bytes[3]) / 127.0) - 1.0
+    return 1.0 if sign >= 0.0 else -1.0
+
+
+def _decode_color_bytes(color_bytes) -> Optional[Tuple[float, float, float, float]]:
+    if color_bytes is None or len(color_bytes) < 4:
+        return None
+    return tuple(float(component) / 255.0 for component in color_bytes[:4])
 
 
 def _read_faces(data: bytes, offset: int, num_faces: int) -> Tuple[List[Tuple[int, int, int]], int]:
@@ -958,6 +1068,12 @@ def _parse_v2_or_v3(data: bytes, version: str, offset: int) -> dict:
         "positions": _extract_vertex_attribute(vertices, "position"),
         "normals": _extract_vertex_attribute(vertices, "normal"),
         "uvs": _extract_vertex_attribute(vertices, "uv"),
+        "tangents": _extract_vertex_attribute(vertices, "tangent"),
+        "tangent_bytes": _extract_vertex_attribute(vertices, "tangent_bytes"),
+        "tangent_signs": _extract_vertex_attribute(vertices, "tangent_sign"),
+        "tangent_sign_bytes": _extract_vertex_attribute(vertices, "tangent_sign_byte"),
+        "colors": _extract_vertex_attribute(vertices, "color"),
+        "color_bytes": _extract_vertex_attribute(vertices, "color_bytes"),
         "vertex_weights": [{} for _ in range(num_verts)],
         "bone_names": [],
         "has_skinning": False,
@@ -1036,6 +1152,12 @@ def _parse_v4_or_v5(data: bytes, version: str, offset: int) -> dict:
         "positions": _extract_vertex_attribute(vertices, "position"),
         "normals": _extract_vertex_attribute(vertices, "normal"),
         "uvs": _extract_vertex_attribute(vertices, "uv"),
+        "tangents": _extract_vertex_attribute(vertices, "tangent"),
+        "tangent_bytes": _extract_vertex_attribute(vertices, "tangent_bytes"),
+        "tangent_signs": _extract_vertex_attribute(vertices, "tangent_sign"),
+        "tangent_sign_bytes": _extract_vertex_attribute(vertices, "tangent_sign_byte"),
+        "colors": _extract_vertex_attribute(vertices, "color"),
+        "color_bytes": _extract_vertex_attribute(vertices, "color_bytes"),
         "vertex_weights": vertex_weights,
         "bone_names": bone_names,
         "bones": bones,
@@ -1103,13 +1225,13 @@ def _get_blender_draco_dll_path() -> Optional[Path]:
 
 
 def _load_blender_draco_dll():
-    global _DRACO_DLL
+    global _DRACO_DLL, _DRACO_LOAD_ERROR
     if _DRACO_DLL is not _DRACO_DLL_UNINITIALIZED:
         return _DRACO_DLL
 
     dll_path = _get_blender_draco_dll_path()
     if dll_path is None:
-        _DRACO_DLL = None
+        _DRACO_LOAD_ERROR = "blender draco library was not found"
         return None
 
     try:
@@ -1136,10 +1258,11 @@ def _load_blender_draco_dll():
         dll.decoderGetIndicesByteLength.argtypes = [ctypes.c_void_p]
         dll.decoderCopyIndices.restype = None
         dll.decoderCopyIndices.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-    except Exception:
-        _DRACO_DLL = None
+    except Exception as exc:
+        _DRACO_LOAD_ERROR = f"failed to load {dll_path}: {exc}"
         return None
 
+    _DRACO_LOAD_ERROR = None
     _DRACO_DLL = dll
     return dll
 
@@ -1162,7 +1285,23 @@ def _decode_draco_attribute_buffer(
 
     buffer = ctypes.create_string_buffer(byte_length)
     dll.decoderCopyAttribute(decoder, attr_id, buffer)
-    values = struct.unpack_from(f"<{vertex_count * components}f", buffer.raw, 0)
+    if component_type == _GLTF_COMPONENT_TYPE_FLOAT32:
+        format_char = "f"
+        component_size = 4
+    elif component_type == _GLTF_COMPONENT_TYPE_UINT8:
+        format_char = "B"
+        component_size = 1
+    else:
+        return None
+
+    value_count = vertex_count * components
+    expected_byte_length = value_count * component_size
+    if byte_length < expected_byte_length:
+        raise RuntimeError(
+            f"draco attribute {attr_id} length {byte_length} is shorter than expected {expected_byte_length}"
+        )
+
+    values = struct.unpack_from(f"<{value_count}{format_char}", buffer.raw, 0)
     return [tuple(values[index : index + components]) for index in range(0, len(values), components)]
 
 
@@ -1173,10 +1312,13 @@ def _decode_draco_coremesh_v2(chunk: bytes) -> Optional[Tuple[List[dict], List[T
     draco_bitstream_size = struct.unpack_from("<I", chunk, 0)[0]
     if 4 + draco_bitstream_size > len(chunk):
         raise ValueError("truncated v7 draco coremesh payload")
+    if 4 + draco_bitstream_size != len(chunk):
+        raise ValueError("unexpected trailing bytes in v7 draco coremesh payload")
 
     dll = _load_blender_draco_dll()
     if dll is None:
-        raise RuntimeError("draco decoder is unavailable for version 7 coremesh")
+        detail = f": {_DRACO_LOAD_ERROR}" if _DRACO_LOAD_ERROR else ""
+        raise RuntimeError(f"draco decoder is unavailable for version 7 coremesh{detail}")
 
     bitstream = chunk[4 : 4 + draco_bitstream_size]
     bitstream_buffer = ctypes.create_string_buffer(bitstream, len(bitstream))
@@ -1220,29 +1362,67 @@ def _decode_draco_coremesh_v2(chunk: bytes) -> Optional[Tuple[List[dict], List[T
             2,
             vertex_count,
         )
+        tangents = _decode_draco_attribute_buffer(
+            dll,
+            decoder,
+            3,
+            _GLTF_COMPONENT_TYPE_UINT8,
+            b"VEC4",
+            4,
+            vertex_count,
+        )
+        colors = _decode_draco_attribute_buffer(
+            dll,
+            decoder,
+            4,
+            _GLTF_COMPONENT_TYPE_UINT8,
+            b"VEC4",
+            4,
+            vertex_count,
+        )
 
         if positions is None:
             raise RuntimeError("draco coremesh did not expose a position attribute")
 
         faces: List[Tuple[int, int, int]] = []
-        if index_count > 0 and dll.decoderReadIndices(decoder, _GLTF_COMPONENT_TYPE_UINT32):
+        if index_count > 0:
+            if not dll.decoderReadIndices(decoder, _GLTF_COMPONENT_TYPE_UINT32):
+                raise RuntimeError("draco coremesh exposed indices but they could not be read")
+
             byte_length = int(dll.decoderGetIndicesByteLength(decoder))
-            if byte_length > 0:
-                index_buffer = ctypes.create_string_buffer(byte_length)
-                dll.decoderCopyIndices(decoder, index_buffer)
-                flat_indices = struct.unpack_from(f"<{index_count}I", index_buffer.raw, 0)
-                faces = [
-                    (flat_indices[index], flat_indices[index + 1], flat_indices[index + 2])
-                    for index in range(0, len(flat_indices) - 2, 3)
-                ]
+            expected_index_bytes = index_count * 4
+            if byte_length < expected_index_bytes:
+                raise RuntimeError(
+                    f"draco index buffer length {byte_length} is shorter than expected {expected_index_bytes}"
+                )
+            if index_count % 3 != 0:
+                raise RuntimeError(f"draco index count {index_count} is not divisible by 3")
+
+            index_buffer = ctypes.create_string_buffer(byte_length)
+            dll.decoderCopyIndices(decoder, index_buffer)
+            flat_indices = struct.unpack_from(f"<{index_count}I", index_buffer.raw, 0)
+            if flat_indices and max(flat_indices) >= vertex_count:
+                raise RuntimeError("draco coremesh index references a missing vertex")
+            faces = [
+                (flat_indices[index], flat_indices[index + 1], flat_indices[index + 2])
+                for index in range(0, len(flat_indices), 3)
+            ]
 
         vertices = []
         for index, position in enumerate(positions):
+            tangent_bytes = tangents[index] if tangents and index < len(tangents) else None
+            color_bytes = colors[index] if colors and index < len(colors) else None
             vertices.append(
                 {
                     "position": position,
                     "normal": normals[index] if normals and index < len(normals) else None,
                     "uv": uvs[index] if uvs and index < len(uvs) else None,
+                    "tangent": _decode_tangent_bytes(tangent_bytes),
+                    "tangent_bytes": tangent_bytes,
+                    "tangent_sign": _decode_tangent_sign(tangent_bytes),
+                    "tangent_sign_byte": tangent_bytes[3] if tangent_bytes is not None else None,
+                    "color": _decode_color_bytes(color_bytes),
+                    "color_bytes": color_bytes,
                 }
             )
         return vertices, faces, vertex_count
@@ -1291,6 +1471,9 @@ def _parse_lods_chunk(chunk: bytes) -> dict:
         raise ValueError("truncated lod offsets")
 
     lod_offsets = list(struct.unpack_from(f"<{num_lod_offsets}I", chunk, offset)) if num_lod_offsets > 0 else []
+    offset += num_lod_offsets * 4
+    if offset != len(chunk):
+        raise ValueError("unexpected trailing bytes in lods chunk")
     return {
         "lod_type": int(lod_type),
         "num_high_quality_lods": int(num_high_quality_lods),
@@ -1312,21 +1495,36 @@ def _parse_v6_or_v7(data: bytes, version: str, offset: int) -> dict:
         "num_high_quality_lods": 0,
         "lod_offsets": [],
     }
+    coremesh_vertex_count = None
+    skinning_vertex_count = None
 
-    while offset + 16 <= len(data):
+    while offset < len(data):
+        if offset + 16 > len(data):
+            raise ValueError("truncated filemesh chunk header")
+
         chunk_type_raw = data[offset : offset + 8]
         chunk_type = chunk_type_raw.decode("ascii", errors="ignore").rstrip("\0 ")
         chunk_version, chunk_size = struct.unpack_from("<II", data, offset + 8)
-        chunk_data = data[offset + 16 : offset + 16 + chunk_size]
-        offset += 16 + chunk_size
+        chunk_end = offset + 16 + chunk_size
+        if chunk_end > len(data):
+            raise ValueError(f"truncated {chunk_type or 'unknown'} chunk payload")
+        chunk_data = data[offset + 16 : chunk_end]
+        offset = chunk_end
 
         if chunk_type == "COREMESH" and chunk_version == 1:
             vertices, faces, num_vertices = _parse_coremesh_v1(chunk_data)
+            coremesh_vertex_count = num_vertices
         elif chunk_type == "COREMESH" and chunk_version == 2:
             vertices, faces, num_vertices = _decode_draco_coremesh_v2(chunk_data)
+            coremesh_vertex_count = num_vertices
         elif chunk_type == "SKINNING" and chunk_version == 1:
             skinning_data = _parse_skinning_chunk(chunk_data)
-            num_vertices = max(num_vertices, skinning_data["num_vertices"])
+            skinning_vertex_count = skinning_data["num_vertices"]
+            if coremesh_vertex_count is not None and skinning_vertex_count != coremesh_vertex_count:
+                raise ValueError(
+                    f"skinning vertex count {skinning_vertex_count} does not match coremesh vertex count {coremesh_vertex_count}"
+                )
+            num_vertices = max(num_vertices, skinning_vertex_count)
             vertex_weights = skinning_data["vertex_weights"]
             bone_names = skinning_data["bone_names"]
             bones = skinning_data.get("bones") or []
@@ -1335,6 +1533,11 @@ def _parse_v6_or_v7(data: bytes, version: str, offset: int) -> dict:
             lod_metadata = _parse_lods_chunk(chunk_data)
         elif chunk_type == "FACS" and chunk_version == 1:
             facs_metadata = _parse_facs_chunk(chunk_data)
+
+    if coremesh_vertex_count is not None and skinning_vertex_count is not None and skinning_vertex_count != coremesh_vertex_count:
+        raise ValueError(
+            f"skinning vertex count {skinning_vertex_count} does not match coremesh vertex count {coremesh_vertex_count}"
+        )
 
     if version.startswith("version 7") and vertices is None:
         raise RuntimeError("version 7 filemesh could not decode draco coremesh data")
@@ -1349,6 +1552,12 @@ def _parse_v6_or_v7(data: bytes, version: str, offset: int) -> dict:
         "positions": _extract_vertex_attribute(vertices or [], "position") if vertices is not None else None,
         "normals": _extract_vertex_attribute(vertices or [], "normal") if vertices is not None else None,
         "uvs": _extract_vertex_attribute(vertices or [], "uv") if vertices is not None else None,
+        "tangents": _extract_vertex_attribute(vertices or [], "tangent") if vertices is not None else None,
+        "tangent_bytes": _extract_vertex_attribute(vertices or [], "tangent_bytes") if vertices is not None else None,
+        "tangent_signs": _extract_vertex_attribute(vertices or [], "tangent_sign") if vertices is not None else None,
+        "tangent_sign_bytes": _extract_vertex_attribute(vertices or [], "tangent_sign_byte") if vertices is not None else None,
+        "colors": _extract_vertex_attribute(vertices or [], "color") if vertices is not None else None,
+        "color_bytes": _extract_vertex_attribute(vertices or [], "color_bytes") if vertices is not None else None,
         "vertex_weights": vertex_weights,
         "bone_names": bone_names,
         "bones": bones,

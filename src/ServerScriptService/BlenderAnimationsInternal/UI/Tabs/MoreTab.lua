@@ -42,7 +42,15 @@ local DONATION_SUPPORTERS = {
 	[1129195252] = "#6a71ba", -- Wingboy0
 	[1552097906] = "#e8c5e3", -- megeservice
 	[7180198] = "#7b5bbd", -- ZacAttackk
-	[2038901944] = "#9900ff" -- Aeresei
+	[2038901944] = "#9900ff", -- Aeresei
+	[2238155578] = "#63a2d6", -- KGxStar1
+	[44780781] = "#c8adde", -- OneSpottedFriend
+	[91427417] = "#a5ccb1", -- Pigeon
+	[1045107396] = "#5da4c2", -- AuroraSharky
+	[1109656080] = "#db3e39", -- FNTDrippy
+	[10333709] = "#c250cc", -- Setalcix
+	[291518017] = "#8a757b", -- aloneluvsya
+	[74229507] = "#618c6b", -- Psychem
 
 	
 	

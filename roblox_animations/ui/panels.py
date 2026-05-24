@@ -303,63 +303,84 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         # COM controls: only expose Weights editing (pivot control removed)
         com_actions.operator("object.rbxanims_edit_com_weights", text="Weights")
         
-        # --- AutoPhysics Sub-section ---
-        col.separator()
-        col.row(align=True)
-        # physics_row.label(text="AutoPhysics:", icon="PHYSICS")
-        
-        # # Check if AutoPhysics is enabled
+        # # --- AutoPhysics Sub-section ---
+        # col.separator()
+        # physics_row = col.row(align=True)
+        # physics_row.label(text="", icon="PHYSICS")
+
         # try:
-        #     from ..rig.physics import is_physics_enabled, is_ghost_enabled, get_frame_state
+        #     from ..rig.physics import (
+        #         is_physics_enabled,
+        #         is_ghost_enabled,
+        #         get_trajectory_summary,
+        #         get_trajectory_ik_assist_summary,
+        #     )
+
         #     physics_enabled = is_physics_enabled()
         #     ghost_enabled = is_ghost_enabled() if physics_enabled else False
-        # except:
+        #     trajectory_summary = get_trajectory_summary()
+        #     ik_assist_summary = get_trajectory_ik_assist_summary(selected_armature)
+        # except Exception:
         #     physics_enabled = False
-            # ghost_enabled = False
-        
-        # physics_row.operator(
+        #     ghost_enabled = False
+        #     trajectory_summary = {
+        #         "has_analysis": False,
+        #         "has_issue": False,
+        #         "state": "unknown",
+        #         "focus_frame": None,
+        #     }
+        #     ik_assist_summary = {"can_apply": False}
+
+        # physics_controls = physics_row.row(align=True)
+        # physics_controls.enabled = selected_armature is not None
+        # physics_controls.operator(
         #     "object.rbxanims_toggle_autophysics",
         #     text="",
-        #     icon="PLAY" if not physics_enabled else "PAUSE",
-        #     depress=physics_enabled
+        #     icon="PAUSE" if physics_enabled else "PLAY",
+        #     depress=physics_enabled,
         # )
-        
+        # physics_controls.operator(
+        #     "object.rbxanims_analyze_physics",
+        #     text="",
+        #     icon="FILE_REFRESH",
+        # )
+
+        # focus_icon = "ERROR" if trajectory_summary.get("has_issue") else "VIEWZOOM"
+        # physics_controls.operator(
+        #     "object.rbxanims_focus_trajectory",
+        #     text="",
+        #     icon=focus_icon,
+        #     depress=bool(trajectory_summary.get("has_issue")),
+        # )
+        # physics_controls.operator(
+        #     "object.rbxanims_apply_trajectory_ik",
+        #     text="",
+        #     icon="CON_KINEMATIC",
+        #     depress=bool(ik_assist_summary.get("can_apply")),
+        # )
+
         # if physics_enabled:
-        #     # Ghost toggle
-        #     physics_row.operator(
+        #     physics_controls.operator(
         #         "object.rbxanims_toggle_physics_ghost",
         #         text="",
         #         icon="GHOST_ENABLED" if ghost_enabled else "GHOST_DISABLED",
-        #         depress=ghost_enabled
+        #         depress=ghost_enabled,
         #     )
-            
-        #     # Gravity scale slider
-        #     if settings:
-        #         col.prop(settings, "rbx_physics_gravity", text="Gravity")
-            
-        #     # Show current frame state
-        #     try:
-        #         frame = context.scene.frame_current
-        #         state = get_frame_state(frame)
-        #         state_icons = {
-        #             "grounded": "CHECKMARK",
-        #             "airborne": "SORT_DESC",
-        #             "invalid": "ERROR",
-        #             "unknown": "QUESTION",
-        #         }
-        #         state_colors = {
-        #             "grounded": "Grounded",
-        #             "airborne": "Airborne",
-        #             "invalid": "Invalid",
-        #             "unknown": "Unknown",
-        #         }
-        #         col.label(text=f"Frame {frame}: {state_colors.get(state, state)}", 
-        #                  icon=state_icons.get(state, "QUESTION"))
-        #     except:
-        #         pass
-            
-        #     # Re-analyze button
-        #     col.operator("object.rbxanims_analyze_physics", text="Re-analyze", icon="FILE_REFRESH")
+
+        # if settings and physics_enabled:
+        #     state_icons = {
+        #         "grounded": "CHECKMARK",
+        #         "airborne": "SORT_DESC",
+        #         "invalid": "ERROR",
+        #         "extrapolated": "INFO",
+        #         "unknown": "QUESTION",
+        #     }
+        #     state_row = col.row(align=True)
+        #     state_row.label(
+        #         text="",
+        #         icon=state_icons.get(trajectory_summary.get("state"), "QUESTION"),
+        #     )
+        #     state_row.prop(settings, "rbx_physics_gravity", text="")
             
         #     # COM manipulation tools
         #     col.separator()
@@ -411,7 +432,9 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         col = animation_box.column()
         col.label(text="Animation", icon="ACTION")
         if run_deform_path and settings:
-            col.prop(settings, "rbx_deform_rig_scale", text="Deform Scale")
+            col.prop(settings, "rbx_auto_deform_scale", text="Auto Deform Scale")
+            if not settings.rbx_auto_deform_scale:
+                col.prop(settings, "rbx_deform_rig_scale", text="Manual Unit Scale")
         col.operator("object.rbxanims_importfbxanimation", text="Import from .fbx")
         col.operator("object.rbxanims_mapkeyframes", text="Map from Active Rig")
         col.operator("object.rbxanims_applytransform", text="Apply Object Transform")
@@ -433,7 +456,7 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         validation_box.label(text="UGC Emote Validation", icon="CHECKMARK")
         row = validation_box.row(align=True)
         if settings:
-            row.prop(settings, "rbx_max_studs_per_frame", text="Max studs/frame")
+            row.prop(settings, "rbx_max_studs_per_frame", text="Max studs/frame @30fps")
         row = validation_box.row(align=True)
         row.operator(
             "object.rbxanims_validate_motionpaths",

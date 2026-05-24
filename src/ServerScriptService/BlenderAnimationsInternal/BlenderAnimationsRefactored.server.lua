@@ -22,9 +22,9 @@ local CameraManager = require(script.Parent.Services.CameraManager)
 -- Import UI components
 local PlayerTab = require(script.Parent.UI.Tabs.PlayerTab)
 local RiggingTab = require(script.Parent.UI.Tabs.RiggingTab)
-local BlenderSyncTab = require(script.Parent.UI.Tabs.BlenderSyncTab)
 local ToolsTab = require(script.Parent.UI.Tabs.ToolsTab)
 local MoreTab = require(script.Parent.UI.Tabs.MoreTab)
+local SharedComponents = require(script.Parent.UI.SharedComponents)
 
 local Plugin = plugin
 
@@ -57,6 +57,8 @@ local OnEvent = Fusion.OnEvent
 local Value = Fusion.Value
 local Computed = Fusion.Computed
 local Observer = Fusion.Observer
+
+local GLOBAL_HEADER_HEIGHT = 108
 
 -- Initialize services
 local playbackService = PlaybackService.new(State, Types) :: any
@@ -218,7 +220,8 @@ local function updateActiveRigFromSelection()
 					State.activeRigExists:set(true)
 					rigManager:clearWarnings()
 					State.loadingEnabled:set(true) -- Enable loading indicator
-					State.activeRig = selectedObject
+					State.activeRigModel = selectedObject
+					State.activeRig = nil
 					task.spawn(function()
 						rigManager:setRig(selectedObject)
 					end)
@@ -394,7 +397,7 @@ do -- Creates the plugin
 
     -- merge saved tab order with defaults (forward-compatible)
     do
-        local defaults = { "Player", "Rigging", "Blender Sync", "Tools", "More" }
+        local defaults = { "Player", "Rigging", "Tools", "More" }
         local defaultSet = {}
         for _, name in ipairs(defaults) do defaultSet[name] = true end
 
@@ -622,7 +625,6 @@ do -- Creates the plugin
 	local tabContent = {
 		Player = PlayerTab.create(services),
 		Rigging = RiggingTab.create(services),
-		["Blender Sync"] = BlenderSyncTab.create(services),
 		Tools = ToolsTab.create(services),
 		More = MoreTab.create(services),
 	}
@@ -666,7 +668,6 @@ do -- Creates the plugin
 	local tabFrames = {
 		_PlayerTab = makeTabFrame("Player", tabContent.Player),
 		_RiggingTab = makeTabFrame("Rigging", tabContent.Rigging),
-		_BlenderSyncTab = makeTabFrame("Blender Sync", tabContent["Blender Sync"]),
 		_ToolsTab = makeTabFrame("Tools", tabContent.Tools),
 		_MoreTab = makeTabFrame("More", tabContent.More),
 	}
@@ -706,20 +707,41 @@ do -- Creates the plugin
 				BackgroundTransparency = 1,
 				[Children] = {
 					createTabsUI(),
-					ScrollFrame({
+					New("Frame")({
+						Name = "GlobalHeader",
 						ZIndex = 1,
-						Size = UDim2.new(1, -40, 1, 0),
+						Size = UDim2.new(1, -40, 0, GLOBAL_HEADER_HEIGHT),
 						Position = Computed(function()
 							return if State.dockSide:get() == Enum.InitialDockState.Left
 								then UDim2.fromOffset(40, 0)
 								else UDim2.fromOffset(0, 0)
 						end),
 						BackgroundTransparency = 1,
+						[Children] = {
+							SharedComponents.createHeaderUI(services),
+							New("Frame")({
+								Name = "HeaderDivider",
+								AnchorPoint = Vector2.new(0, 1),
+								Position = UDim2.new(0, 0, 1, 0),
+								Size = UDim2.new(1, 0, 0, 1),
+								BackgroundColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.Border),
+								BorderSizePixel = 0,
+							}),
+						},
+					}),
+					ScrollFrame({
+						ZIndex = 1,
+						Size = UDim2.new(1, -40, 1, -GLOBAL_HEADER_HEIGHT),
+						Position = Computed(function()
+							return if State.dockSide:get() == Enum.InitialDockState.Left
+								then UDim2.fromOffset(40, GLOBAL_HEADER_HEIGHT)
+								else UDim2.fromOffset(0, GLOBAL_HEADER_HEIGHT)
+						end),
+						BackgroundTransparency = 1,
 						AutomaticCanvasSize = Enum.AutomaticSize.Y,
 						[Children] = {
 							_PlayerTab = tabFrames._PlayerTab,
 							_RiggingTab = tabFrames._RiggingTab,
-							_BlenderSyncTab = tabFrames._BlenderSyncTab,
 							_ToolsTab = tabFrames._ToolsTab,
 							_MoreTab = tabFrames._MoreTab,
 						},

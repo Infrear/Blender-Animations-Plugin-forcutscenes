@@ -11,6 +11,41 @@ local BlenderConnection = require(script.Parent.Parent.Components.BlenderConnect
 local BlenderSyncManager = {}
 BlenderSyncManager.__index = BlenderSyncManager
 
+local REST_DISTANCE_EPSILON = 1e-5
+
+local function buildTargetBoneRestCalibration(activeRig: any): any?
+	if not activeRig or not activeRig.bones then
+		return nil
+	end
+
+	local bones = {}
+	local boneCount = 0
+	for boneName, rigPart in pairs(activeRig.bones) do
+		local part = rigPart and rigPart.part
+		if typeof(part) == "Instance" and part:IsA("Bone") then
+			local position = part.CFrame.Position
+			local distance = position.Magnitude
+			if distance > REST_DISTANCE_EPSILON then
+				bones[boneName] = {
+					parent = part.Parent and part.Parent.Name or nil,
+					distance = distance,
+				}
+				boneCount += 1
+			end
+		end
+	end
+
+	if boneCount == 0 then
+		return nil
+	end
+
+	return {
+		rig_name = activeRig.model and activeRig.model.Name or nil,
+		bone_count = boneCount,
+		bones = bones,
+	}
+end
+
 function BlenderSyncManager.new(playbackService: any, animationManager: any)
 	local self = setmetatable({}, BlenderSyncManager)
 	
@@ -73,7 +108,8 @@ function BlenderSyncManager:importAnimationFromBlender()
 		return false
 	end
 
-	local responseBody = self.blenderConnectionService:ImportAnimation(State.serverPort:get(), (armature :: any).name)
+	local targetBoneRest = buildTargetBoneRestCalibration(State.activeRig)
+	local responseBody = self.blenderConnectionService:ImportAnimation(State.serverPort:get(), (armature :: any).name, targetBoneRest)
 
 	if responseBody then
 		-- The response is binary, so we pass `true`

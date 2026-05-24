@@ -80,8 +80,34 @@ local function focusCurrentCameraOnRigPrimaryPart()
 	end
 end
 
+local METADATA_ROUND_SCALE = 1000
+
+local function roundMetadataNumber(value: number): number
+	local scaled = value * METADATA_ROUND_SCALE
+	if scaled >= 0 then
+		return math.floor(scaled + 0.5) / METADATA_ROUND_SCALE
+	end
+	return math.ceil(scaled - 0.5) / METADATA_ROUND_SCALE
+end
+
+local function vector3Components(vector: Vector3): { number }
+	return {
+		roundMetadataNumber(vector.X),
+		roundMetadataNumber(vector.Y),
+		roundMetadataNumber(vector.Z),
+	}
+end
+
+local function volumeComponent(vector: Vector3): number
+	return roundMetadataNumber(vector.X * vector.Y * vector.Z)
+end
+
 local function cfComponents(cf: CFrame): { number }
-	return { cf:GetComponents() }
+	local components = { cf:GetComponents() }
+	for i = 1, #components do
+		components[i] = roundMetadataNumber(components[i])
+	end
+	return components
 end
 
 local function tryReadProperty(inst: Instance, propName: string)
@@ -145,17 +171,17 @@ local function getWrapLayerData(meshPart: MeshPart): any?
 
 	local order = tryReadProperty(wrapLayer, "Order")
 	if type(order) == "number" then
-		data.order = order
+		data.order = roundMetadataNumber(order)
 	end
 
 	local puffiness = tryReadProperty(wrapLayer, "Puffiness")
 	if type(puffiness) == "number" then
-		data.puffiness = puffiness
+		data.puffiness = roundMetadataNumber(puffiness)
 	end
 
 	local shrinkFactor = tryReadProperty(wrapLayer, "ShrinkFactor")
 	if type(shrinkFactor) == "number" then
-		data.shrink_factor = shrinkFactor
+		data.shrink_factor = roundMetadataNumber(shrinkFactor)
 	end
 
 	return data
@@ -187,7 +213,7 @@ local function getWrapTargetData(meshPart: MeshPart): any?
 
 	local stiffness = tryReadProperty(wrapTarget, "Stiffness")
 	if type(stiffness) == "number" then
-		data.stiffness = stiffness
+		data.stiffness = roundMetadataNumber(stiffness)
 	end
 
 	return data
@@ -230,17 +256,19 @@ end
 function ExportManager:reencodeJointMetadata(
 	rigNode: any,
 	partEncodeMap: { [Instance]: string },
-	usedJointNames: { [string]: boolean }?
-)
+	usedJointNames: { [string]: boolean }?,
+	meshToBoneMap: { [string]: string }?
+): { [string]: string }
 	-- Initialize usedJointNames on first call (root node)
 	usedJointNames = usedJointNames or {}
+	meshToBoneMap = meshToBoneMap or {}
 	local jointNames = usedJointNames :: { [string]: boolean }
 
 	-- round transform matrices (compresses data)
 	for _, transform in pairs({ "transform", "jointtransform0", "jointtransform1" }) do
 		if rigNode[transform] then
 			for i = 1, #rigNode[transform] do
-				rigNode[transform][i] = math.floor(rigNode[transform][i] * 10000 + 0.5) / 10000
+				rigNode[transform][i] = roundMetadataNumber(rigNode[transform][i])
 			end
 		end
 	end
@@ -250,38 +278,44 @@ function ExportManager:reencodeJointMetadata(
 		for auxIdx, auxCf in pairs(rigNode.auxTransform) do
 			if auxCf and type(auxCf) == "table" then
 				for i = 1, #auxCf do
-					auxCf[i] = math.floor(auxCf[i] * 10000 + 0.5) / 10000
+					auxCf[i] = roundMetadataNumber(auxCf[i])
 				end
 			end
 		end
 	end
 
-	-- Uniquify jname only for Welds (not Motor6Ds) to avoid collisions like multiple "Handle" bones
 	local originalJname = rigNode.jname
 	local jointType = rigNode.jointType
 	local isWeld = jointType == "Weld" or jointType == "WeldConstraint"
 
-	-- When a weld joint is named "Handle" (or "Handle"), use the canonical
-	-- exported part name instead so Blender gets a meaningful bone name.
-	if originalJname and isWeld and originalJname:lower():sub(1, 6) == "handle" then
-		local canonicalName = partEncodeMap[rigNode.inst]
-		if canonicalName and canonicalName:lower():sub(1, 6) ~= "handle" then
-			originalJname = sanitizeHandleExportName(canonicalName)
-		end
-	end
-
-	if originalJname and isWeld then
-		local uniqueJname = originalJname
+	-- For welds, use the stable exported part name as the jname so that meshToBone
+	-- becomes an identity mapping and eliminates traversal-order mismatch bugs.
+	-- partEncodeMap names are already globally unique per-instance.
+	if isWeld then
+		local inst = rigNode.inst
+		local baseJname = inst and partEncodeMap[inst] or originalJname
+		local uniqueJname = baseJname
 		local retryCount = 0
 		while jointNames[uniqueJname] do
 			retryCount = retryCount + 1
-			uniqueJname = originalJname .. retryCount
+			uniqueJname = baseJname .. retryCount
 		end
 		jointNames[uniqueJname] = true
 		rigNode.jname = uniqueJname
 	elseif originalJname then
 		-- Track Motor6D names too so welds don't collide with them
 		jointNames[originalJname] = true
+	end
+
+	-- Build authoritative mesh->bone mapping using the DIRECT instance
+	-- reference BEFORE nilifying it.  This avoids order-mismatch bugs
+	-- where jname uniquification order diverges from partEncodeMap order.
+	local inst = rigNode.inst
+	if inst then
+		local meshName = partEncodeMap[inst]
+		if meshName and rigNode.jname then
+			meshToBoneMap[meshName] = rigNode.jname
+		end
 	end
 
 	rigNode.pname = partEncodeMap[rigNode.inst]
@@ -295,8 +329,10 @@ function ExportManager:reencodeJointMetadata(
 	end
 
 	for _, child in pairs(rigNode.children) do
-		self:reencodeJointMetadata(child, partEncodeMap, usedJointNames)
+		self:reencodeJointMetadata(child, partEncodeMap, usedJointNames, meshToBoneMap)
 	end
+
+	return meshToBoneMap
 end
 
 function ExportManager:generateMetadata(rigModelToExport: Types.RigModelType, originalMap: { [Instance]: Instance }): any?
@@ -351,26 +387,28 @@ function ExportManager:generateMetadata(rigModelToExport: Types.RigModelType, or
 			local auxEntry = {
 				idx = partCount,
 				name = desc.Name,
-				dims_fp = { desc.Size.X, desc.Size.Y, desc.Size.Z },
-				vol_fp = desc.Size.X * desc.Size.Y * desc.Size.Z, -- Fallback for Mesh Volume calculation
-				part_size = { originalSize.X, originalSize.Y, originalSize.Z },
-				part_cf = { sourceInst.CFrame:GetComponents() },
+				dims_fp = vector3Components(desc.Size),
+				vol_fp = volumeComponent(desc.Size), -- Fallback for Mesh Volume calculation
+				part_size = vector3Components(originalSize),
+				part_cf = cfComponents(sourceInst.CFrame),
 			}
 
 			if sourceInst:IsA("MeshPart") then
 				local meshSource = sourceInst :: MeshPart
 				local hasSkinning = meshPartHasSkinning(meshSource)
-				local wrapLayerData = getWrapLayerData(meshSource)
-				local wrapTargetData = getWrapTargetData(meshSource)
 				auxEntry.mesh_class = "MeshPart"
-				auxEntry.mesh_id = tostring(meshSource.MeshId)
-				auxEntry.mesh_size = { meshSource.MeshSize.X, meshSource.MeshSize.Y, meshSource.MeshSize.Z }
 				auxEntry.has_skinning = hasSkinning
-				if wrapLayerData then
-					auxEntry.wrap_layer = wrapLayerData
-				end
-				if wrapTargetData then
-					auxEntry.wrap_target = wrapTargetData
+				if hasSkinning then
+					auxEntry.mesh_id = tostring(meshSource.MeshId)
+					auxEntry.mesh_size = vector3Components(meshSource.MeshSize)
+					local wrapLayerData = getWrapLayerData(meshSource)
+					local wrapTargetData = getWrapTargetData(meshSource)
+					if wrapLayerData then
+						auxEntry.wrap_layer = wrapLayerData
+					end
+					if wrapTargetData then
+						auxEntry.wrap_target = wrapTargetData
+					end
 				end
 			end
 
@@ -396,7 +434,7 @@ function ExportManager:generateMetadata(rigModelToExport: Types.RigModelType, or
 		return nil
 	end
 
-	self:reencodeJointMetadata(encodedRig, partEncodeMap)
+	local meshToBoneData = self:reencodeJointMetadata(encodedRig, partEncodeMap)
 	print(string.format("[ExportManager] generateMetadata: exported %d parts", #partNames))
 
 	return {
@@ -404,6 +442,7 @@ function ExportManager:generateMetadata(rigModelToExport: Types.RigModelType, or
 		parts = partNames,
 		rig = encodedRig,
 		partAux = partAuxData,
+		meshToBone = meshToBoneData,
 		version = "1.6",
 	}
 end
@@ -461,26 +500,28 @@ function ExportManager:generateMetadataLegacy(
 			local auxEntry = {
 				idx = partCount,
 				name = desc.Name,
-				dims_fp = { desc.Size.X, desc.Size.Y, desc.Size.Z },
-				vol_fp = desc.Size.X * desc.Size.Y * desc.Size.Z,
-				part_size = { originalSize.X, originalSize.Y, originalSize.Z },
-				part_cf = { sourceInst.CFrame:GetComponents() },
+				dims_fp = vector3Components(desc.Size),
+				vol_fp = volumeComponent(desc.Size),
+				part_size = vector3Components(originalSize),
+				part_cf = cfComponents(sourceInst.CFrame),
 			}
 
 			if sourceInst:IsA("MeshPart") then
 				local meshSource = sourceInst :: MeshPart
 				local hasSkinning = meshPartHasSkinning(meshSource)
-				local wrapLayerData = getWrapLayerData(meshSource)
-				local wrapTargetData = getWrapTargetData(meshSource)
 				auxEntry.mesh_class = "MeshPart"
-				auxEntry.mesh_id = tostring(meshSource.MeshId)
-				auxEntry.mesh_size = { meshSource.MeshSize.X, meshSource.MeshSize.Y, meshSource.MeshSize.Z }
 				auxEntry.has_skinning = hasSkinning
-				if wrapLayerData then
-					auxEntry.wrap_layer = wrapLayerData
-				end
-				if wrapTargetData then
-					auxEntry.wrap_target = wrapTargetData
+				if hasSkinning then
+					auxEntry.mesh_id = tostring(meshSource.MeshId)
+					auxEntry.mesh_size = vector3Components(meshSource.MeshSize)
+					local wrapLayerData = getWrapLayerData(meshSource)
+					local wrapTargetData = getWrapTargetData(meshSource)
+					if wrapLayerData then
+						auxEntry.wrap_layer = wrapLayerData
+					end
+					if wrapTargetData then
+						auxEntry.wrap_target = wrapTargetData
+					end
 				end
 			end
 
@@ -496,7 +537,7 @@ function ExportManager:generateMetadataLegacy(
 		return nil
 	end
 
-	self:reencodeJointMetadata(encodedRig, partEncodeMap)
+	local meshToBoneData = self:reencodeJointMetadata(encodedRig, partEncodeMap)
 	print(string.format("[ExportManager] generateMetadataLegacy: exported %d parts", partCount))
 
 	-- print("[ExportManager] Exporting Legacy with skinned mesh + wrap metadata (v1.5)")
@@ -506,6 +547,7 @@ function ExportManager:generateMetadataLegacy(
 		parts = partRoles,
 		rig = encodedRig,
 		partAux = partAuxData,
+		meshToBone = meshToBoneData,
 		version = "1.6",
 	}
 end
@@ -1074,8 +1116,8 @@ function ExportManager:exportWeapon()
 		table.insert(partAuxData, {
 			idx = partCount,
 			name = part.Name,
-			dims_fp = { part.Size.X, part.Size.Y, part.Size.Z },
-			vol_fp = part.Size.X * part.Size.Y * part.Size.Z,
+			dims_fp = vector3Components(part.Size),
+			vol_fp = volumeComponent(part.Size),
 		})
 
 		-- rename to p<N>x (same pattern as rig export for consistent OBJ naming)
@@ -1105,18 +1147,18 @@ function ExportManager:exportWeapon()
 			jointType = nil,
 		}
 
-		elem.transform = { part.CFrame:GetComponents() }
+		elem.transform = cfComponents(part.CFrame)
 
 		if parentPart and connectingJoint then
 			local joint = connectingJoint :: any
 			if joint:IsA("Motor6D") or joint:IsA("Weld") then
 				local parentIsPart0 = (joint.Part0 == parentPart)
 				if parentIsPart0 then
-					elem.jointtransform0 = { joint.C0:GetComponents() }
-					elem.jointtransform1 = { joint.C1:GetComponents() }
+					elem.jointtransform0 = cfComponents(joint.C0)
+					elem.jointtransform1 = cfComponents(joint.C1)
 				else
-					elem.jointtransform0 = { joint.C1:GetComponents() }
-					elem.jointtransform1 = { joint.C0:GetComponents() }
+					elem.jointtransform0 = cfComponents(joint.C1)
+					elem.jointtransform1 = cfComponents(joint.C0)
 				end
 				elem.jointType = joint.ClassName
 				if joint:IsA("Motor6D") then
@@ -1124,8 +1166,8 @@ function ExportManager:exportWeapon()
 				end
 			elseif joint:IsA("WeldConstraint") then
 				local parentToChild = parentPart.CFrame:ToObjectSpace(part.CFrame)
-				elem.jointtransform0 = { parentToChild:GetComponents() }
-				elem.jointtransform1 = { CFrame.new():GetComponents() }
+				elem.jointtransform0 = cfComponents(parentToChild)
+				elem.jointtransform1 = cfComponents(CFrame.new())
 				elem.jointType = "WeldConstraint"
 			end
 		end
@@ -1165,16 +1207,16 @@ function ExportManager:exportWeapon()
 			local charIsPart0 = (j.Part0 == entry.characterPart)
 			if j:IsA("Motor6D") or j:IsA("Weld") then
 				if charIsPart0 then
-					info.connectionC0 = { j.C0:GetComponents() }
-					info.connectionC1 = { j.C1:GetComponents() }
+					info.connectionC0 = cfComponents(j.C0)
+					info.connectionC1 = cfComponents(j.C1)
 				else
-					info.connectionC0 = { j.C1:GetComponents() }
-					info.connectionC1 = { j.C0:GetComponents() }
+					info.connectionC0 = cfComponents(j.C1)
+					info.connectionC1 = cfComponents(j.C0)
 				end
 			elseif j:IsA("WeldConstraint") then
 				local relCF = entry.characterPart.CFrame:ToObjectSpace(entry.weaponPart.CFrame)
-				info.connectionC0 = { relCF:GetComponents() }
-				info.connectionC1 = { CFrame.new():GetComponents() }
+				info.connectionC0 = cfComponents(relCF)
+				info.connectionC1 = cfComponents(CFrame.new())
 			end
 			attachmentByRoot[cloneRoot] = info
 			table.insert(weaponAttachments, info)

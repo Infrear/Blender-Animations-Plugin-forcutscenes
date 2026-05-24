@@ -30,6 +30,8 @@ from .face_controls import (
 )
 
 
+# Interpolation types with direct Roblox EasingStyle mappings.
+# Only BEZIER requires dense baking; all others use sparse export.
 _ROBLOX_MAPPED_INTERPOLATIONS = {
     "LINEAR",
     "CONSTANT",
@@ -38,7 +40,290 @@ _ROBLOX_MAPPED_INTERPOLATIONS = {
     "ELASTIC",
 }
 
+_SCALE_EPSILON = 1e-6
+
 _FACE_CONTROL_FCURVE_RE = re.compile(r'^rbx_face_controls\.([A-Za-z0-9_]+)$')
+
+
+def _object_scale_components(obj: "bpy.types.Object") -> Optional[Tuple[float, float, float]]:
+    if not obj:
+        return None
+
+    scale = obj.matrix_world.to_scale()
+    values = (abs(float(scale.x)), abs(float(scale.y)), abs(float(scale.z)))
+    if any(value <= _SCALE_EPSILON for value in values):
+        return None
+
+    return values
+
+
+def _scale_values_are_uniform(values: Optional[Tuple[float, float, float]]) -> bool:
+    if not values:
+        return False
+
+    average = sum(values) / 3.0
+    tolerance = max(_SCALE_EPSILON, average * 1e-5)
+    return not any(abs(value - average) > tolerance for value in values)
+
+
+def _uniform_object_scale(obj: "bpy.types.Object") -> Optional[float]:
+    values = _object_scale_components(obj)
+    if not _scale_values_are_uniform(values):
+        return None
+
+    return sum(values) / 3.0
+
+
+def resolve_scene_unit_scale_factor(
+    settings: Optional[Any] = None,
+    scene: Optional[Any] = None,
+) -> float:
+    if scene is None:
+        scene = getattr(settings, "id_data", None)
+    if scene is None:
+        scene = getattr(bpy.context, "scene", None)
+
+    unit_settings = getattr(scene, "unit_settings", None)
+    scene_unit_scale = getattr(unit_settings, "scale_length", 1.0)
+    try:
+        scene_unit_scale = float(scene_unit_scale)
+    except (TypeError, ValueError):
+        scene_unit_scale = 1.0
+
+    if abs(scene_unit_scale) <= _SCALE_EPSILON:
+        return 1.0
+    return abs(scene_unit_scale)
+
+
+def resolve_manual_deform_rig_scale_factor(
+    settings: Optional[Any] = None,
+    scene: Optional[Any] = None,
+) -> float:
+    configured_scale = getattr(settings, "rbx_deform_rig_scale", None)
+    if configured_scale is None:
+        return resolve_scene_unit_scale_factor(settings, scene)
+
+    try:
+        configured_scale = float(configured_scale)
+    except (TypeError, ValueError):
+        configured_scale = 0.0
+
+    if abs(configured_scale) <= _SCALE_EPSILON:
+        return resolve_scene_unit_scale_factor(settings, scene)
+    return abs(configured_scale)
+
+
+def resolve_deform_rig_scale_factor(
+    ao: "bpy.types.Object",
+    settings: Optional[Any] = None,
+    target_scale_multiplier: Optional[float] = None,
+) -> float:
+    auto_scale = getattr(settings, "rbx_auto_deform_scale", True)
+    if auto_scale:
+        target_calibration = 1.0
+        if target_scale_multiplier is not None:
+            try:
+                target_scale_multiplier = float(target_scale_multiplier)
+            except (TypeError, ValueError):
+                target_scale_multiplier = 1.0
+            if target_scale_multiplier > _SCALE_EPSILON:
+                target_calibration = target_scale_multiplier
+        object_scale = _uniform_object_scale(ao) or 1.0
+        return 1.0 / (object_scale * target_calibration)
+
+    return resolve_manual_deform_rig_scale_factor(settings)
+
+
+def resolve_deform_translation_scale_factor(
+    ao: "bpy.types.Object",
+    settings: Optional[Any] = None,
+    target_scale_multiplier: Optional[float] = None,
+    scale_factor: Optional[float] = None,
+) -> float:
+    """Return the translation normalization factor for deform export.
+
+    Deform serialization works from evaluated/world-space bone matrices, so
+    object scale is already baked into translation deltas. Auto scale should
+    therefore normalize only by target calibration, not by object scale a second
+    time.
+    """
+    auto_scale = getattr(settings, "rbx_auto_deform_scale", True)
+    if scale_factor is None:
+        scale_factor = resolve_deform_rig_scale_factor(
+            ao,
+            settings,
+            target_scale_multiplier=target_scale_multiplier,
+        )
+
+    try:
+        scale_factor = float(scale_factor)
+    except (TypeError, ValueError):
+        scale_factor = 1.0
+
+    if not auto_scale:
+        return scale_factor if abs(scale_factor) > _SCALE_EPSILON else 1.0
+
+    object_scale = _uniform_object_scale(ao) or 1.0
+    translation_scale_factor = scale_factor * object_scale
+    if abs(translation_scale_factor) <= _SCALE_EPSILON:
+        return 1.0
+    return translation_scale_factor
+
+
+def extract_deform_rest_scale_samples(
+    ao: "bpy.types.Object",
+) -> Dict[str, Dict[str, Any]]:
+    samples: Dict[str, Dict[str, Any]] = {}
+    if not ao or ao.type != "ARMATURE" or not getattr(ao, "pose", None):
+        return samples
+
+    back_trans = get_transform_to_blender().inverted()
+    world_transform = back_trans @ ao.matrix_world
+    rest_cache: Dict[str, Matrix] = {}
+    sorted_bones = sorted(ao.pose.bones, key=lambda bone: len(bone.parent_recursive))
+
+    for pose_bone in sorted_bones:
+        if is_face_control_bone(pose_bone):
+            continue
+
+        rest_matrix = _orthonormalized_transform(
+            world_transform @ pose_bone.bone.matrix_local
+        )
+        rest_cache[pose_bone.name] = rest_matrix
+
+        parent_name = pose_bone.parent.name if pose_bone.parent else None
+        parent_rest = rest_cache.get(parent_name) if parent_name else None
+        if parent_rest is not None:
+            try:
+                local_rest = parent_rest.inverted() @ rest_matrix
+            except ValueError:
+                local_rest = rest_matrix
+        else:
+            local_rest = rest_matrix
+
+        distance = float(local_rest.to_translation().length)
+        if distance <= _SCALE_EPSILON:
+            continue
+
+        samples[pose_bone.name] = {
+            "parent": parent_name,
+            "distance": distance,
+        }
+
+    return samples
+
+
+def _target_rest_bones_from_payload(
+    target_bone_rest: Optional[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    if not isinstance(target_bone_rest, dict):
+        return {}
+
+    payload_bones = target_bone_rest.get("bones", target_bone_rest)
+    bones: Dict[str, Dict[str, Any]] = {}
+
+    if isinstance(payload_bones, dict):
+        for bone_name, entry in payload_bones.items():
+            if not isinstance(bone_name, str):
+                continue
+            if isinstance(entry, dict):
+                bones[bone_name] = entry
+            elif isinstance(entry, (int, float)):
+                bones[bone_name] = {"distance": entry}
+    elif isinstance(payload_bones, list):
+        for entry in payload_bones:
+            if not isinstance(entry, dict):
+                continue
+            bone_name = entry.get("name") or entry.get("bone")
+            if isinstance(bone_name, str):
+                bones[bone_name] = entry
+
+    return bones
+
+
+def calculate_deform_target_scale_calibration(
+    ao: "bpy.types.Object",
+    target_bone_rest: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    target_bones = _target_rest_bones_from_payload(target_bone_rest)
+    if not target_bones:
+        return None
+
+    source_samples = extract_deform_rest_scale_samples(ao)
+    if not source_samples:
+        return None
+
+    ratios: List[float] = []
+    matches: List[Dict[str, Any]] = []
+
+    for bone_name, target_entry in target_bones.items():
+        source_entry = source_samples.get(bone_name)
+        if not source_entry:
+            continue
+
+        try:
+            target_distance = float(
+                target_entry.get("distance", target_entry.get("localDistance", 0.0))
+            )
+        except (TypeError, ValueError):
+            continue
+
+        source_distance = float(source_entry.get("distance") or 0.0)
+        if target_distance <= _SCALE_EPSILON or source_distance <= _SCALE_EPSILON:
+            continue
+
+        target_parent = target_entry.get("parent")
+        source_parent = source_entry.get("parent")
+        if (
+            isinstance(target_parent, str)
+            and target_parent in source_samples
+            and source_parent
+            and target_parent != source_parent
+        ):
+            continue
+
+        ratio = target_distance / source_distance
+        if ratio <= _SCALE_EPSILON or not math.isfinite(ratio):
+            continue
+
+        ratios.append(ratio)
+        matches.append(
+            {
+                "bone": bone_name,
+                "source_distance": source_distance,
+                "target_distance": target_distance,
+                "ratio": ratio,
+            }
+        )
+
+    if not ratios:
+        return None
+
+    sorted_ratios = sorted(ratios)
+    middle = len(sorted_ratios) // 2
+    if len(sorted_ratios) % 2:
+        multiplier = sorted_ratios[middle]
+    else:
+        multiplier = (sorted_ratios[middle - 1] + sorted_ratios[middle]) / 2.0
+
+    return {
+        "multiplier": float(multiplier),
+        "sample_count": len(ratios),
+        "source_sample_count": len(source_samples),
+        "target_sample_count": len(target_bones),
+        "samples": matches[:12],
+    }
+
+
+def _orthonormalized_transform(mat: Matrix) -> Matrix:
+    try:
+        loc, rot, _scale = mat.decompose()
+    except Exception:
+        loc = mat.to_translation()
+        rot = mat.to_quaternion()
+    normalized = rot.to_matrix().to_4x4()
+    normalized.translation = loc
+    return normalized
 
 
 def _lookup_interp_for_frame(
@@ -293,127 +578,127 @@ def serialize_animation_state(
 
         if has_motor6d_props:
             # --- Traditional Motor6D bone logic ---
-            bcache = ensure_cache(bone.name)
-            extr_inv = bcache.get("extr_inv")
-            orig_base_mat = bcache.get("orig_base_mat")
+            try:
+                bcache = ensure_cache(bone.name)
+                extr_inv = bcache.get("extr_inv")
+                orig_base_mat = bcache.get("orig_base_mat")
 
-            if extr_inv is None:
-                nicetransform = get_cached_matrix(
-                    bone.name,
-                    "nicetransform",
-                    lambda: to_matrix(bone.bone.get("nicetransform")),
-                )
-                extr_inv = nicetransform.inverted()
-                bcache["extr_inv"] = extr_inv
-            if orig_base_mat is None:
-                orig_mat = to_matrix(bone.bone.get("transform"))
-                orig_mat_tr1 = to_matrix(bone.bone.get("transform1"))
-                orig_base_mat = back_trans @ (orig_mat @ orig_mat_tr1)
-                bcache["orig_base_mat"] = orig_base_mat
-
-            cur_obj_transform = back_trans @ (bone.matrix @ extr_inv)
-            
-            # Check if this is a world-space bone that needs parent compensation
-            if bone.name in worldspace_bones:
-                original_parent_name = worldspace_bones[bone.name]
-                original_parent_bone = pose_bones.get(original_parent_name)
-                
-                if original_parent_bone:
-                    # Get the original parent's transforms
-                    parent_has_motor6d = (
-                        "transform" in original_parent_bone.bone
-                        and "transform1" in original_parent_bone.bone
-                        and "nicetransform" in original_parent_bone.bone
+                if extr_inv is None:
+                    nicetransform = get_cached_matrix(
+                        bone.name,
+                        "nicetransform",
+                        lambda: to_matrix(bone.bone.get("nicetransform")),
                     )
+                    extr_inv = nicetransform.inverted()
+                    bcache["extr_inv"] = extr_inv
+                if orig_base_mat is None:
+                    orig_mat = to_matrix(bone.bone.get("transform"))
+                    orig_mat_tr1 = to_matrix(bone.bone.get("transform1"))
+                    orig_base_mat = back_trans @ (orig_mat @ orig_mat_tr1)
+                    bcache["orig_base_mat"] = orig_base_mat
+
+                cur_obj_transform = back_trans @ (bone.matrix @ extr_inv)
+
+                # Check if this is a world-space bone that needs parent compensation
+                if bone.name in worldspace_bones:
+                    original_parent_name = worldspace_bones[bone.name]
+                    original_parent_bone = pose_bones.get(original_parent_name)
                     
-                    if parent_has_motor6d:
-                        pcb = ensure_cache(original_parent_name)
+                    if original_parent_bone:
+                        # Get the original parent's transforms
+                        parent_has_motor6d = (
+                            "transform" in original_parent_bone.bone
+                            and "transform1" in original_parent_bone.bone
+                            and "nicetransform" in original_parent_bone.bone
+                        )
+                        
+                        if parent_has_motor6d:
+                            pcb = ensure_cache(original_parent_name)
+                            parent_extr_inv = pcb.get("extr_inv")
+                            parent_orig_base_mat = pcb.get("orig_base_mat")
+                            
+                            if parent_extr_inv is None:
+                                parent_nicetransform = get_cached_matrix(
+                                    original_parent_name,
+                                    "nicetransform",
+                                    lambda: to_matrix(original_parent_bone.bone.get("nicetransform")),
+                                )
+                                parent_extr_inv = parent_nicetransform.inverted()
+                                pcb["extr_inv"] = parent_extr_inv
+                            if parent_orig_base_mat is None:
+                                p_orig_mat = to_matrix(original_parent_bone.bone.get("transform"))
+                                p_orig_mat_tr1 = to_matrix(original_parent_bone.bone.get("transform1"))
+                                parent_orig_base_mat = back_trans @ (p_orig_mat @ p_orig_mat_tr1)
+                                pcb["orig_base_mat"] = parent_orig_base_mat
+                            
+                            # Current parent world transform
+                            parent_cur_transform = back_trans @ (original_parent_bone.matrix @ parent_extr_inv)
+                            
+                            # The bone's world-space target (where it should stay)
+                            world_target = cur_obj_transform
+                            
+                            # Calculate what the local transform should be relative to current parent
+                            local_relative_to_parent = parent_cur_transform.inverted() @ world_target
+                            
+                            # Original local transform (rest pose relative to parent at rest)
+                            orig_local = parent_orig_base_mat.inverted() @ orig_base_mat
+                            
+                            # The delta we need to apply
+                            bone_transform = orig_local.inverted() @ local_relative_to_parent
+                        else:
+                            # Parent is not motor6d, just use world-space delta
+                            bone_transform = orig_base_mat.inverted() @ cur_obj_transform
+                    else:
+                        # Original parent not found, use world-space delta
+                        bone_transform = orig_base_mat.inverted() @ cur_obj_transform
+
+                elif bone.parent:
+                    parent_has_motor6d_props = (
+                        "transform" in bone.parent.bone
+                        and "transform1" in bone.parent.bone
+                        and "nicetransform" in bone.parent.bone
+                    )
+                    if parent_has_motor6d_props:
+                        pcb = ensure_cache(bone.parent.name)
                         parent_extr_inv = pcb.get("extr_inv")
                         parent_orig_base_mat = pcb.get("orig_base_mat")
-                        
                         if parent_extr_inv is None:
                             parent_nicetransform = get_cached_matrix(
-                                original_parent_name,
+                                bone.parent.name,
                                 "nicetransform",
-                                lambda: to_matrix(original_parent_bone.bone.get("nicetransform")),
+                                lambda: to_matrix(bone.parent.bone.get("nicetransform")),
                             )
                             parent_extr_inv = parent_nicetransform.inverted()
                             pcb["extr_inv"] = parent_extr_inv
                         if parent_orig_base_mat is None:
-                            p_orig_mat = to_matrix(original_parent_bone.bone.get("transform"))
-                            p_orig_mat_tr1 = to_matrix(original_parent_bone.bone.get("transform1"))
-                            parent_orig_base_mat = back_trans @ (p_orig_mat @ p_orig_mat_tr1)
+                            p_orig_mat = to_matrix(bone.parent.bone.get("transform"))
+                            p_orig_mat_tr1 = to_matrix(bone.parent.bone.get("transform1"))
+                            parent_orig_base_mat = back_trans @ (
+                                p_orig_mat @ p_orig_mat_tr1
+                            )
                             pcb["orig_base_mat"] = parent_orig_base_mat
-                        
-                        # Current parent world transform
-                        parent_cur_transform = back_trans @ (original_parent_bone.matrix @ parent_extr_inv)
-                        
-                        # The bone's world-space target (where it should stay)
-                        # This is the current pose of the bone in world space
-                        world_target = cur_obj_transform
-                        
-                        # Calculate what the local transform should be relative to current parent
-                        # to achieve the world target position
-                        # local = parent^-1 @ world
-                        local_relative_to_parent = parent_cur_transform.inverted() @ world_target
-                        
-                        # Original local transform (rest pose relative to parent at rest)
-                        orig_local = parent_orig_base_mat.inverted() @ orig_base_mat
-                        
-                        # The delta we need to apply
-                        bone_transform = orig_local.inverted() @ local_relative_to_parent
+
+                        parent_obj_transform = back_trans @ (
+                            bone.parent.matrix @ parent_extr_inv
+                        )
+                        orig_transform = parent_orig_base_mat.inverted() @ orig_base_mat
+                        cur_transform = parent_obj_transform.inverted() @ cur_obj_transform
+                        bone_transform = orig_transform.inverted() @ cur_transform
                     else:
-                        # Parent is not motor6d, just use world-space delta
+                        # Parent is a new bone, which is now handled by the deform serializer.
+                        # This bone is treated as a root in the context of Motor6D calculations.
                         bone_transform = orig_base_mat.inverted() @ cur_obj_transform
                 else:
-                    # Original parent not found, use world-space delta
                     bone_transform = orig_base_mat.inverted() @ cur_obj_transform
 
-            elif bone.parent:
-                parent_has_motor6d_props = (
-                    "transform" in bone.parent.bone
-                    and "transform1" in bone.parent.bone
-                    and "nicetransform" in bone.parent.bone
-                )
-                if parent_has_motor6d_props:
-                    pcb = ensure_cache(bone.parent.name)
-                    parent_extr_inv = pcb.get("extr_inv")
-                    parent_orig_base_mat = pcb.get("orig_base_mat")
-                    if parent_extr_inv is None:
-                        parent_nicetransform = get_cached_matrix(
-                            bone.parent.name,
-                            "nicetransform",
-                            lambda: to_matrix(bone.parent.bone.get("nicetransform")),
-                        )
-                        parent_extr_inv = parent_nicetransform.inverted()
-                        pcb["extr_inv"] = parent_extr_inv
-                    if parent_orig_base_mat is None:
-                        p_orig_mat = to_matrix(bone.parent.bone.get("transform"))
-                        p_orig_mat_tr1 = to_matrix(bone.parent.bone.get("transform1"))
-                        parent_orig_base_mat = back_trans @ (
-                            p_orig_mat @ p_orig_mat_tr1
-                        )
-                        pcb["orig_base_mat"] = parent_orig_base_mat
+                statel = mat_to_cf(bone_transform)
+                if cf_round:
+                    statel = [round(x, cf_round_fac) for x in statel]
 
-                    parent_obj_transform = back_trans @ (
-                        bone.parent.matrix @ parent_extr_inv
-                    )
-                    orig_transform = parent_orig_base_mat.inverted() @ orig_base_mat
-                    cur_transform = parent_obj_transform.inverted() @ cur_obj_transform
-                    bone_transform = orig_transform.inverted() @ cur_transform
-                else:
-                    # Parent is a new bone, which is now handled by the deform serializer.
-                    # This bone is treated as a root in the context of Motor6D calculations.
-                    bone_transform = orig_base_mat.inverted() @ cur_obj_transform
-            else:
-                bone_transform = orig_base_mat.inverted() @ cur_obj_transform
-
-            statel = mat_to_cf(bone_transform)
-            if cf_round:
-                statel = [round(x, cf_round_fac) for x in statel]
-
-            if statel != identity_cf:
-                state[bone.name] = statel
+                if statel != identity_cf:
+                    state[bone.name] = statel
+            except Exception as e:
+                print(f"[Export] Skipping bone '{bone.name}' due to serialization error: {e}")
 
     return state
 
@@ -441,23 +726,38 @@ def serialize_deform_animation_state(
 
     if scale_factor_cached is None:
         settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
-        scale_factor = getattr(settings, "rbx_deform_rig_scale", 1.0)
-        if scale_factor == 0:
-            scale_factor = 1.0
+        scale_factor = resolve_deform_rig_scale_factor(ao, settings)
     else:
         scale_factor = scale_factor_cached
+    settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+    translation_scale_factor = resolve_deform_translation_scale_factor(
+        ao,
+        settings,
+        scale_factor=scale_factor,
+    )
 
     state: Dict[str, List[float]] = {}
     bone_cache: Dict[str, Tuple[Matrix, Matrix]] = {}
 
-    # Pre-populate cache for all non-Motor6D bones to simplify parent lookups
+    deform_chain_bones: Set[str] = set()
+    if is_skinned_rig:
+        for pose_bone in ao.pose.bones:
+            if is_face_control_bone(pose_bone) or not pose_bone.bone.use_deform:
+                continue
+            current_bone = pose_bone
+            while current_bone:
+                if not is_face_control_bone(current_bone):
+                    deform_chain_bones.add(current_bone.name)
+                current_bone = current_bone.parent
+
+    # Pre-populate cache for deform/helper bones to simplify parent lookups
     bones_to_process = []
     for bone in ao.pose.bones:
         if is_face_control_bone(bone):
             continue
         if excluded_bones and bone.name in excluded_bones:
             continue
-        # Exclude Motor6D bones from deform serialization
+        # Exclude Motor6D bones from deform serialization (same as v2.4.6)
         if (
             "transform" in bone.bone
             and "transform1" in bone.bone
@@ -473,109 +773,135 @@ def serialize_deform_animation_state(
     # Cache for motor6d parent transforms to avoid repeated to_matrix/inverted work per frame
     motor_parent_cache: Dict[str, Tuple[Matrix, Matrix]] = {}
 
-    # Enhanced parent transform lookup that handles motor6d parents and deform parents
-    def get_parent_transforms(bone):
-        if not bone.parent:
+    worldspace_bones: Dict[str, str] = {}
+    for bone in ao.pose.bones:
+        if is_face_control_bone(bone):
+            continue
+        if excluded_bones and bone.name in excluded_bones:
+            continue
+        if bone.bone.get("worldspace_bone"):
+            original_parent = bone.bone.get("worldspace_original_parent", "")
+            if original_parent:
+                worldspace_bones[bone.name] = original_parent
+
+    def get_bone_space_transforms(space_bone):
+        if not space_bone:
             return None, None
 
-        # Check if parent is in deform bone cache
-        if bone.parent.name in bone_cache:
-            return bone_cache.get(bone.parent.name)
+        if space_bone.name in bone_cache:
+            return bone_cache.get(space_bone.name)
 
         # Parent is not in cache, check if it's a motor6d bone
         parent_has_motor6d_props = (
-            "transform" in bone.parent.bone
-            and "transform1" in bone.parent.bone
-            and "nicetransform" in bone.parent.bone
+            "transform" in space_bone.bone
+            and "transform1" in space_bone.bone
+            and "nicetransform" in space_bone.bone
         )
 
         if parent_has_motor6d_props:
             # Convert motor6d parent to roblox space for deform calculation (cached)
-            cached = motor_parent_cache.get(bone.parent.name)
+            cached = motor_parent_cache.get(space_bone.name)
             if cached:
                 return cached
 
-            parent_nicetransform = to_matrix(bone.parent.bone.get("nicetransform"))
+            parent_nicetransform = to_matrix(space_bone.bone.get("nicetransform"))
             parent_extr_inv = parent_nicetransform.inverted()
 
-            parent_current = world_transform @ (bone.parent.matrix @ parent_extr_inv)
-            parent_rest = world_transform @ (
-                bone.parent.bone.matrix_local @ parent_extr_inv
+            parent_current = _orthonormalized_transform(
+                world_transform @ (space_bone.matrix @ parent_extr_inv)
+            )
+            parent_rest = _orthonormalized_transform(
+                world_transform @ (
+                    space_bone.bone.matrix_local @ parent_extr_inv
+                )
             )
 
-            motor_parent_cache[bone.parent.name] = (parent_current, parent_rest)
+            motor_parent_cache[space_bone.name] = (parent_current, parent_rest)
             return (parent_current, parent_rest)
 
         # Parent is neither deform nor motor6d, treat as root
         return None, None
 
+    def get_parent_transforms(bone):
+        if bone.name in worldspace_bones:
+            original_parent = ao.pose.bones.get(worldspace_bones[bone.name])
+            return get_bone_space_transforms(original_parent)
+
+        return get_bone_space_transforms(bone.parent)
+
     for bone in bones_to_process:
         # For deform and new bones alike, use Blender-space matrices converted once to Roblox space
-        current_matrix = world_transform @ bone.matrix
-        rest_matrix = world_transform @ bone.bone.matrix_local
+        current_matrix = _orthonormalized_transform(world_transform @ bone.matrix)
+        rest_matrix = _orthonormalized_transform(
+            world_transform @ bone.bone.matrix_local
+        )
         bone_cache[bone.name] = (current_matrix, rest_matrix)
 
     for bone in bones_to_process:
-        current_matrix, rest_matrix = bone_cache[bone.name]
+        try:
+            current_matrix, rest_matrix = bone_cache[bone.name]
 
-        if bone.parent:
-            parent_transforms = get_parent_transforms(bone)
-            if parent_transforms:
-                parent_current, parent_rest = parent_transforms
-                try:
-                    current_local_transform = parent_current.inverted() @ current_matrix
-                    rest_local_transform = parent_rest.inverted() @ rest_matrix
-                    delta_transform = (
-                        rest_local_transform.inverted() @ current_local_transform
-                    )
-                except ValueError:
+            if bone.parent or bone.name in worldspace_bones:
+                parent_transforms = get_parent_transforms(bone)
+                if parent_transforms[0] is not None and parent_transforms[1] is not None:
+                    parent_current, parent_rest = parent_transforms
+                    try:
+                        current_local_transform = parent_current.inverted() @ current_matrix
+                        rest_local_transform = parent_rest.inverted() @ rest_matrix
+                        delta_transform = (
+                            rest_local_transform.inverted() @ current_local_transform
+                        )
+                    except ValueError:
+                        delta_transform = rest_matrix.inverted() @ current_matrix
+                else:
+                    # Parent is not a deform bone, treat as root
                     delta_transform = rest_matrix.inverted() @ current_matrix
             else:
-                # Parent is not a deform bone, treat as root
                 delta_transform = rest_matrix.inverted() @ current_matrix
-        else:
-            delta_transform = rest_matrix.inverted() @ current_matrix
 
-        # Branch behavior: deform bones vs new/helper bones
-        if is_skinned_rig and bone.bone.use_deform:
-            # Deform bones: apply corrected Roblox space conversion (axis swizzles and scaling)
-            loc, rot, sca = delta_transform.decompose()
-            sf = scale_factor if scale_factor != 0 else 1.0
+            # Branch behavior: skinned deform-chain bones vs new/helper bones.
+            if is_skinned_rig and bone.name in deform_chain_bones:
+                # Deform-chain bones: apply corrected Roblox space conversion (axis swizzles and scaling)
+                loc, rot, _sca = delta_transform.decompose()
+                sf = (
+                    translation_scale_factor
+                    if abs(translation_scale_factor) > _SCALE_EPSILON
+                    else 1.0
+                )
 
-            # Apply inverse scale to translation and swizzle axes for Roblox
-            loc = loc / sf
-            loc_roblox = Vector((-loc.x, loc.y, -loc.z))
+                # Apply inverse scale to translation and swizzle axes for Roblox
+                loc = loc / sf
+                loc_roblox = Vector((-loc.x, loc.y, -loc.z))
 
-            # Swizzle scale axes for Roblox
-            sca_roblox = Vector((sca.x, sca.z, sca.y))
+                # Flip rotation axes for Roblox
+                rot.x, rot.z = -rot.x, -rot.z
 
-            # Flip rotation axes for Roblox
-            rot.x, rot.z = -rot.x, -rot.z
+                # Reconstruct final transform without scale; Roblox Pose CFrames cannot
+                # represent scale, and rest-matrix scale leakage distorts normalized playback.
+                loc_mat = Matrix.Translation(loc_roblox)
+                rot_mat = rot.to_matrix().to_4x4()
+                final_transform = loc_mat @ rot_mat
+            else:
+                # New/helper bones: no scaling; apply position swizzle only (-x, y, -z)
+                tr = delta_transform.to_translation()
+                tr_swizzled = Vector((-tr.x, tr.y, -tr.z))
+                rot_m3 = delta_transform.to_3x3()
+                try:
+                    rot_m3.normalize()
+                except Exception:
+                    pass
+                loc_mat = Matrix.Translation(tr_swizzled)
+                rot_mat = rot_m3.to_4x4()
+                final_transform = loc_mat @ rot_mat
 
-            # Reconstruct final transform: Translate -> Rotate -> Scale
-            loc_mat = Matrix.Translation(loc_roblox)
-            rot_mat = rot.to_matrix().to_4x4()
-            sca_mat = Matrix.Diagonal(sca_roblox).to_4x4()
-            final_transform = loc_mat @ rot_mat @ sca_mat
-        else:
-            # New/helper bones: no scaling; apply position swizzle only (-x, y, -z)
-            tr = delta_transform.to_translation()
-            tr_swizzled = Vector((-tr.x, tr.y, -tr.z))
-            rot_m3 = delta_transform.to_3x3()
-            try:
-                rot_m3.normalize()
-            except Exception:
-                pass
-            loc_mat = Matrix.Translation(tr_swizzled)
-            rot_mat = rot_m3.to_4x4()
-            final_transform = loc_mat @ rot_mat
+            statel = mat_to_cf(final_transform)
+            if cf_round:
+                statel = [round(x, cf_round_fac) for x in statel]
 
-        statel = mat_to_cf(final_transform)
-        if cf_round:
-            statel = [round(x, cf_round_fac) for x in statel]
-
-        if statel != identity_cf:
-            state[bone.name] = statel
+            if statel != identity_cf:
+                state[bone.name] = statel
+        except Exception as e:
+            print(f"[Export] Skipping deform bone '{bone.name}' due to serialization error: {e}")
 
     return state
 
@@ -637,19 +963,24 @@ def get_ik_affected_bones(armature_obj: "bpy.types.Object") -> Set[str]:
     if not armature_obj or armature_obj.type != "ARMATURE":
         return ik_bones
 
+    def add_ik_chain(tail_bone, chain_count):
+        ik_bones.add(tail_bone.name)
+        current_bone = tail_bone
+        if chain_count and chain_count > 0:
+            remaining = int(chain_count)
+            while remaining > 0 and current_bone.parent:
+                current_bone = current_bone.parent
+                ik_bones.add(current_bone.name)
+                remaining -= 1
+        else:
+            while current_bone.parent:
+                current_bone = current_bone.parent
+                ik_bones.add(current_bone.name)
+
     for bone in armature_obj.pose.bones:
         for constraint in bone.constraints:
             if constraint.type == "IK":
-                # This bone is the end of the chain, add it
-                ik_bones.add(bone.name)
-                # Add the parents in the chain up to the chain_count
-                current_bone = bone
-                for _ in range(constraint.chain_count):
-                    if current_bone.parent:
-                        current_bone = current_bone.parent
-                        ik_bones.add(current_bone.name)
-                    else:
-                        break  # Stop if we reach a root bone
+                add_ik_chain(bone, getattr(constraint, "chain_count", 0))
     return ik_bones
 
 
@@ -662,22 +993,52 @@ def get_all_constrained_bones(armature_obj: "bpy.types.Object") -> Set[str]:
     if not armature_obj or armature_obj.type != "ARMATURE":
         return constrained_bones
 
+    def add_ik_chain(tail_bone, chain_count):
+        constrained_bones.add(tail_bone.name)
+        current_bone = tail_bone
+        if chain_count and chain_count > 0:
+            remaining = int(chain_count)
+            while remaining > 0 and current_bone.parent:
+                current_bone = current_bone.parent
+                constrained_bones.add(current_bone.name)
+                remaining -= 1
+        else:
+            while current_bone.parent:
+                current_bone = current_bone.parent
+                constrained_bones.add(current_bone.name)
+
     for bone in armature_obj.pose.bones:
         if bone.constraints:
             constrained_bones.add(bone.name)
             for constraint in bone.constraints:
-                if constraint.type == "IK" and constraint.chain_count > 0:
-                    # chain_count specifies how many parent bones are affected.
-                    # The bone with the constraint is already added above.
-                    # Now add chain_count parent bones.
-                    current_bone = bone
-                    for _ in range(constraint.chain_count):
-                        if current_bone.parent:
-                            current_bone = current_bone.parent
-                            constrained_bones.add(current_bone.name)
-                        else:
-                            break
+                if constraint.type == "IK":
+                    add_ik_chain(bone, getattr(constraint, "chain_count", 0))
     return constrained_bones
+
+
+def get_deform_descendant_bones(
+    armature_obj: "bpy.types.Object",
+    seed_bones: Set[str],
+) -> Set[str]:
+    """Return seed bones plus transform descendants for skinned/deform baking."""
+    affected_bones: Set[str] = set(seed_bones)
+    if not armature_obj or armature_obj.type != "ARMATURE" or not seed_bones:
+        return affected_bones
+
+    stack = []
+    for bone_name in seed_bones:
+        pose_bone = armature_obj.pose.bones.get(bone_name)
+        if pose_bone:
+            stack.extend(pose_bone.children)
+
+    while stack:
+        pose_bone = stack.pop()
+        if is_face_control_bone(pose_bone):
+            continue
+        affected_bones.add(pose_bone.name)
+        stack.extend(pose_bone.children)
+
+    return affected_bones
 
 
 def get_all_driven_bones(armature_obj: "bpy.types.Object") -> Set[str]:
@@ -705,7 +1066,89 @@ def get_all_driven_bones(armature_obj: "bpy.types.Object") -> Set[str]:
     return driven_bones
 
 
-def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
+def _frame_range_from_fcurves(fcurves: Any) -> Optional[Tuple[int, int]]:
+    frames: List[float] = []
+    for fcurve in fcurves or []:
+        for keyframe_point in getattr(fcurve, "keyframe_points", []) or []:
+            try:
+                frames.append(float(keyframe_point.co.x))
+            except Exception:
+                continue
+
+    if not frames:
+        return None
+
+    return math.floor(min(frames)), math.ceil(max(frames))
+
+
+def _action_keyframe_range(
+    animation_data: Any,
+    action: Optional["bpy.types.Action"],
+) -> Optional[Tuple[int, int]]:
+    if action is None:
+        return None
+
+    try:
+        fcurves = get_action_fcurves(
+            action,
+            slot=get_animation_data_action_slot(animation_data, action=action),
+        )
+    except Exception:
+        fcurves = getattr(action, "fcurves", None) or []
+
+    return _frame_range_from_fcurves(fcurves)
+
+
+def resolve_export_frame_range(ao: "bpy.types.Object") -> Optional[Tuple[int, int]]:
+    """Return the frame range for the armature's current export source."""
+    animation_data = getattr(ao, "animation_data", None)
+    if animation_data is None:
+        return None
+
+    if getattr(animation_data, "use_nla", False):
+        strip_ranges: List[Tuple[float, float]] = []
+        for track in getattr(animation_data, "nla_tracks", []) or []:
+            if getattr(track, "mute", False):
+                continue
+            for strip in getattr(track, "strips", []) or []:
+                if getattr(strip, "action", None) is None:
+                    continue
+                try:
+                    strip_ranges.append((float(strip.frame_start), float(strip.frame_end)))
+                except Exception:
+                    continue
+        if strip_ranges:
+            start = min(frame_range[0] for frame_range in strip_ranges)
+            end = max(frame_range[1] for frame_range in strip_ranges)
+            return math.floor(start), math.ceil(end)
+
+    return _action_keyframe_range(
+        animation_data,
+        getattr(animation_data, "action", None),
+    )
+
+
+def sync_scene_frame_range_to_export_source(
+    scene: "bpy.types.Scene",
+    ao: "bpy.types.Object",
+) -> Optional[Tuple[int, int]]:
+    frame_range = resolve_export_frame_range(ao)
+    if frame_range is None:
+        return None
+
+    frame_start, frame_end = frame_range
+    if frame_end < frame_start:
+        return None
+
+    scene.frame_start = frame_start
+    scene.frame_end = frame_end
+    return frame_range
+
+
+def serialize(
+    ao: "bpy.types.Object",
+    target_bone_rest: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Main serialization function that handles all animation export logic"""
     ctx = bpy.context
     desired_fps = get_scene_fps()
@@ -739,9 +1182,23 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
     back_trans_cached = get_transform_to_blender().inverted()
     world_transform_cached = back_trans_cached @ ao.matrix_world
     settings = getattr(ctx.scene, "rbx_anim_settings", None)
-    scale_factor_cached = getattr(settings, "rbx_deform_rig_scale", 1.0)
-    if scale_factor_cached == 0:
-        scale_factor_cached = 1.0
+    auto_deform_scale_for_calibration = getattr(settings, "rbx_auto_deform_scale", True)
+    target_scale_calibration = None
+    if target_bone_rest and auto_deform_scale_for_calibration:
+        target_scale_calibration = calculate_deform_target_scale_calibration(
+            ao,
+            target_bone_rest,
+        )
+    target_scale_multiplier = (
+        target_scale_calibration.get("multiplier")
+        if target_scale_calibration
+        else None
+    )
+    scale_factor_cached = resolve_deform_rig_scale_factor(
+        ao,
+        settings,
+        target_scale_multiplier=target_scale_multiplier,
+    )
 
     # Check if we should use a simple bake for NLA tracks.
     use_nla_bake = False
@@ -818,6 +1275,18 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
         collected = []
         motor_state_reuse: Dict[str, List[float]] = {}
         deform_state_reuse: Dict[str, List[float]] = {}
+        constrained_bones = get_all_constrained_bones(ao)
+        driven_bones = get_all_driven_bones(ao)
+        if driven_bones:
+            constrained_bones.update(driven_bones)
+        for bone in ao.pose.bones:
+            if not bone.bone.use_inherit_rotation:
+                constrained_bones.add(bone.name)
+        if is_skinned_rig:
+            constrained_bones = get_deform_descendant_bones(
+                ao,
+                constrained_bones,
+            )
         frames = ctx.scene.frame_end + 1 - ctx.scene.frame_start
 
         # cache commonly used values
@@ -855,8 +1324,11 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
             # Wrap the raw state in the same format as the hybrid baker for consistency.
             # Since this path has no easing data, we use a default "Linear".
             wrapped_state = {}
+            for bone_name in constrained_bones:
+                if bone_name not in state:
+                    state[bone_name] = list(identity_cf)
             for bone_name, cframe_data in state.items():
-                wrapped_state[bone_name] = [cframe_data, "Linear", "Out"]
+                wrapped_state[bone_name] = [list(cframe_data), "Linear", "Out"]
 
             keyframe_payload: Dict[str, Any] = {
                 "t": (i - frame_start) / fps,
@@ -876,6 +1348,11 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
         driven_bones = get_all_driven_bones(ao)
         if driven_bones:
             constrained_bones.update(driven_bones)
+        if is_skinned_rig:
+            constrained_bones = get_deform_descendant_bones(
+                ao,
+                constrained_bones,
+            )
 
         # Bones with inherit_rotation disabled must be baked every frame.
         # Roblox Motor6D hierarchy always inherits parent rotation, so the
@@ -892,6 +1369,11 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                 original_parent = bone.bone.get("worldspace_original_parent", "")
                 if original_parent:
                     worldspace_parent_map[bone.name] = original_parent
+        if is_skinned_rig:
+            non_inheriting_bones = get_deform_descendant_bones(
+                ao,
+                non_inheriting_bones,
+            )
 
         animated_bones = set()
         all_actions = set()
@@ -981,11 +1463,12 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                 if frame_start <= frame <= frame_end:
                     keyframe_times.add(frame)
 
-                # If a keyframe uses curved interpolation, we need to bake all the
-                # frames between it and the next keyframe to accurately capture the curve.
-                # only densify segments that actually curve (deviate from linear)
+                # BEZIER handles produce curves that cannot be represented by
+                # Roblox easing styles, so those segments must be densely baked.
+                # Other unsupported interpolations (SINE, QUAD, etc.) fall back
+                # to Linear easing and do not need dense sampling.
                 if (
-                    kp.interpolation not in _ROBLOX_MAPPED_INTERPOLATIONS
+                    kp.interpolation == "BEZIER"
                     and i + 1 < len(fcurve.keyframe_points)
                 ):
                     next_kp = fcurve.keyframe_points[i + 1]
@@ -994,11 +1477,6 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
 
                     # only densify if the segment actually curves
                     if end_bezier_frame - start_bezier_frame > 1:
-                        # For unsupported interpolation styles: always densify
-                        # to preserve the curve shape.
-                        keyframe_times.update(
-                            range(start_bezier_frame + 1, end_bezier_frame)
-                        )
                         if bone_name_for_curve:
                             bezier_segments[bone_name_for_curve].add(
                                 (
@@ -1014,9 +1492,6 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
         frame_start = ctx.scene.frame_start
         frame_end = ctx.scene.frame_end
         fps = desired_fps
-        # hybrid policy:
-        # - with constraints: evaluate every frame; per-bone emission stays sparse except constrained bones
-        # - without constraints: evaluate only sparse keyframes (plus bezier fills collected above)
         full_range = getattr(settings, "rbx_full_range_bake", True)
 
         # Map of {bone_name: {frame_index: (interpolation, easing)}} built from action fcurves
@@ -1108,10 +1583,11 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
 
                 seg_start = max(start_frame + 1, frame_start)
                 seg_end = min(end_frame, frame_end)
+                nonconst_set = bone_non_constant_keyframes.get(bone_name_for_curve, set())
                 for frame_idx in range(seg_start, seg_end):
                     existing = frame_map.get(frame_idx)
-                    # CONSTANT should win ties because Roblox stores one easing
-                    # style per pose keyframe.
+                    if existing is not None and frame_idx in nonconst_set:
+                        continue
                     if existing is None or existing[0] != "CONSTANT":
                         frame_map[frame_idx] = ("CONSTANT", kp.easing)
 
@@ -1253,7 +1729,7 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
             """
             try:
                 for kp in getattr(fc, "keyframe_points", []):
-                    if kp.interpolation not in _ROBLOX_MAPPED_INTERPOLATIONS:
+                    if kp.interpolation == "BEZIER":
                         return True
 
                 for mod in getattr(fc, "modifiers", []):
@@ -1435,8 +1911,14 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
             for f in keyframe_times
             if frame_start <= f <= frame_end and abs(float(f) - round(float(f))) > 1e-8
         ]
-        if subframe_keys:
-            all_frames_to_bake = sorted(set(base_frames).union(subframe_keys))
+        # Collect per-bone dense frames from bezier/unsupported-interpolation segments
+        # so only bones that need dense sampling are evaluated at those frames.
+        bezier_dense_frames = set()
+        for bone_segs in bezier_segments.values():
+            for seg_start, seg_end in bone_segs:
+                bezier_dense_frames.update(range(seg_start + 1, seg_end))
+        if subframe_keys or bezier_dense_frames:
+            all_frames_to_bake = sorted(set(base_frames).union(subframe_keys).union(bezier_dense_frames))
         else:
             all_frames_to_bake = base_frames
 
@@ -1532,6 +2014,12 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                     excluded_face_bones,
                 )
             )
+
+            if is_skinned_rig and last_baked_states:
+                for bone_name in last_baked_states:
+                    if bone_name not in current_full_pose:
+                        current_full_pose[bone_name] = identity_cf
+
             final_kf_state.clear()
             is_boundary_frame = frame == frame_start or frame == frame_end
             face_kf_state, last_face_state = _serialize_face_control_state_for_frame(
@@ -1591,11 +2079,10 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                     or is_cyclic_key
                 )
 
-                # When full_range is enabled, bake ALL animated bones at start and end frames.
-                # For cyclic bones, also bake boundary frames even when full_range is off,
-                # since the animation must cover the entire scene range.
+                # For cyclic bones, bake boundary frames since the animation
+                # must cover the entire scene range.
                 is_cyclic_boundary = bool(cyclic_bones) and bone_name in cyclic_bones and is_boundary_frame
-                is_boundary_bake = (full_range or is_cyclic_boundary) and is_animated and (frame == frame_start or frame == frame_end)
+                is_boundary_bake = (is_boundary_frame or is_cyclic_boundary) and is_animated
 
                 # Determine whether this bone should be baked on this frame
                 should_bake = False
@@ -1603,6 +2090,8 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                 if is_constrained:
                     should_bake = True
                 elif is_non_inheriting:
+                    should_bake = True
+                elif is_skinned_rig:
                     should_bake = True
                 elif is_cyclic_forced:
                     should_bake = True
@@ -1927,14 +2416,79 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
     # Export FPS metadata for consumers (e.g., Roblox) that want to preserve timing
     try:
         scene = ctx.scene
+        object_scale_components = _object_scale_components(ao)
+        object_scale_uniform = _scale_values_are_uniform(object_scale_components)
+        object_scale_axes = list(object_scale_components or (1.0, 1.0, 1.0))
+        auto_deform_scale = getattr(settings, "rbx_auto_deform_scale", True)
+        scene_unit_scale = resolve_scene_unit_scale_factor(settings, scene)
+        calibrated_target_multiplier = float(target_scale_multiplier or 1.0)
+        deform_scale_mode = (
+            "auto_calibrated"
+            if auto_deform_scale and target_scale_calibration
+            else "auto" if auto_deform_scale else "manual"
+        )
         result["export_info"] = {
             "fps": float(desired_fps),
             "fps_base": float(getattr(scene.render, "fps_base", 1.0) or 1.0),
             "frame_start": int(getattr(scene, "frame_start", 0)),
             "frame_end": int(getattr(scene, "frame_end", 0)),
             "frame_step": int(getattr(scene, "frame_step", 1) or 1),
+            "deform_scale_mode": deform_scale_mode,
+            "deform_scale_factor": float(scale_factor_cached),
+            "deform_target_scale_multiplier": float(calibrated_target_multiplier),
+            "scene_unit_scale": float(scene_unit_scale),
+            "deform_target_scale_sample_count": int(
+                target_scale_calibration.get("sample_count", 0)
+                if target_scale_calibration
+                else 0
+            ),
+            "armature_object_scale": float(_uniform_object_scale(ao) or 1.0),
+            "armature_object_scale_axes": [float(value) for value in object_scale_axes],
+            "armature_object_scale_uniform": bool(object_scale_uniform),
+            "deform_position_scale_reliable": bool(
+                (not auto_deform_scale) or object_scale_uniform
+            ),
             "time_unit": "seconds",
         }
+        if auto_deform_scale and not object_scale_uniform:
+            result["export_info"]["deform_scale_warning"] = (
+                "Auto deform scale only supports uniform armature object scale. "
+                "Apply scale or use manual scale for nonuniform/scaled-shear rigs."
+            )
+        if target_scale_calibration:
+            result["export_info"]["deform_target_scale_source_sample_count"] = int(
+                target_scale_calibration.get("source_sample_count", 0)
+            )
+            result["export_info"]["deform_target_scale_target_sample_count"] = int(
+                target_scale_calibration.get("target_sample_count", 0)
+            )
+        elif is_skinned_rig and auto_deform_scale and not target_bone_rest:
+            result["export_info"]["deform_target_scale_warning"] = (
+                "No target rig rest data was provided for this skinned export. "
+                "Scale is using armature object scale only; live rig calibration "
+                "was skipped."
+            )
+        elif target_bone_rest and auto_deform_scale:
+            result["export_info"]["deform_target_scale_warning"] = (
+                "Target rig rest data was provided, but no matching nonzero bone "
+                "distances were found for scale calibration."
+            )
+        if is_skinned_rig:
+            print(
+                "Blender Addon: Deform export scale "
+                f"mode={deform_scale_mode} "
+                f"factor={float(scale_factor_cached):.6f} "
+                f"object_scale={float(_uniform_object_scale(ao) or 1.0):.6f} "
+                f"target_multiplier={float(calibrated_target_multiplier):.6f} "
+                f"samples={int(result['export_info']['deform_target_scale_sample_count'])} "
+                f"target_rest={'yes' if bool(target_bone_rest) else 'no'}"
+            )
+            scale_warning = (
+                result["export_info"].get("deform_target_scale_warning")
+                or result["export_info"].get("deform_scale_warning")
+            )
+            if scale_warning:
+                print(f"Blender Addon: {scale_warning}")
     except Exception:
         pass
 

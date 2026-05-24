@@ -1,6 +1,9 @@
+import ctypes
 import gzip
+import io
 import struct
 import unittest
+import urllib.error
 from unittest import mock
 
 from ..animation.face_controls import (
@@ -41,9 +44,101 @@ class _FakeArmature:
         self.pose = _FakePose(face_bones)
 
 
-def _make_vertex(px, py, pz):
+class _FakeDracoDll:
+    def __init__(
+        self,
+        vertex_count=2,
+        index_count=3,
+        index_values=(0, 1, 1),
+        read_indices=True,
+        index_byte_length=None,
+    ):
+        self.vertex_count = vertex_count
+        self.index_count = index_count
+        self.read_indices = read_indices
+        self.position_bytes = struct.pack("<6f", 0.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+        self.index_bytes = struct.pack(f"<{len(index_values)}I", *index_values) if index_values else b""
+        self.index_byte_length = len(self.index_bytes) if index_byte_length is None else index_byte_length
+
+    def decoderCreate(self):
+        return object()
+
+    def decoderRelease(self, _decoder):
+        return None
+
+    def decoderDecode(self, _decoder, _buffer, _size):
+        return True
+
+    def decoderGetVertexCount(self, _decoder):
+        return self.vertex_count
+
+    def decoderGetIndexCount(self, _decoder):
+        return self.index_count
+
+    def decoderReadAttribute(self, _decoder, attr_id, _component_type, _attr_type):
+        return attr_id == 0
+
+    def decoderGetAttributeByteLength(self, _decoder, _attr_id):
+        return len(self.position_bytes)
+
+    def decoderCopyAttribute(self, _decoder, _attr_id, buffer):
+        ctypes.memmove(ctypes.addressof(buffer), self.position_bytes, len(self.position_bytes))
+
+    def decoderReadIndices(self, _decoder, _component_type):
+        return self.read_indices
+
+    def decoderGetIndicesByteLength(self, _decoder):
+        return self.index_byte_length
+
+    def decoderCopyIndices(self, _decoder, buffer):
+        ctypes.memmove(
+            ctypes.addressof(buffer),
+            self.index_bytes,
+            min(len(self.index_bytes), ctypes.sizeof(buffer)),
+        )
+
+
+class _FakeHttpResponse:
+    def __init__(self, data=b"", headers=None):
+        self._data = data
+        self.headers = headers or {}
+
+    def read(self):
+        return self._data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback):
+        return False
+
+
+class _FakeHttpOpener:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = 0
+
+    def open(self, _request, timeout=None):
+        self.calls += 1
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+def _make_http_error(code, headers=None, body=b""):
+    return urllib.error.HTTPError(
+        "https://example.test/mesh",
+        code,
+        "error",
+        headers or {},
+        io.BytesIO(body),
+    )
+
+
+def _make_vertex(px, py, pz, tangent=(127, 127, 0, 254), color=(255, 255, 255, 255)):
     return struct.pack(
-        "<8f4b4B",
+        "<8f4B4B",
         px,
         py,
         pz,
@@ -52,14 +147,8 @@ def _make_vertex(px, py, pz):
         0.0,
         0.0,
         0.0,
-        0,
-        0,
-        0,
-        127,
-        255,
-        255,
-        255,
-        255,
+        *tangent,
+        *color,
     )
 
 
@@ -468,6 +557,33 @@ class TestFileMeshParsing(unittest.TestCase):
         self.assertEqual(extract_asset_id("https://www.roblox.com/asset/?id=456"), 456)
         self.assertEqual(extract_asset_id("789"), 789)
 
+    def test_fetch_url_response_retries_rate_limit_with_retry_after(self):
+        opener = _FakeHttpOpener(
+            [
+                _make_http_error(429, {"Retry-After": "0"}, b"rate limited"),
+                _FakeHttpResponse(b"version 4.00\n", {}),
+            ]
+        )
+
+        with mock.patch.object(filemesh.urllib.request, "build_opener", return_value=opener):
+            with mock.patch.object(filemesh.time, "sleep") as sleep_mock:
+                _response, data = filemesh._fetch_url_response("https://example.test/mesh")
+
+        self.assertEqual(data, b"version 4.00\n")
+        self.assertEqual(opener.calls, 2)
+        sleep_mock.assert_called_once_with(0.0)
+
+    def test_fetch_url_response_does_not_retry_forbidden(self):
+        opener = _FakeHttpOpener([_make_http_error(403, body=b"forbidden")])
+
+        with mock.patch.object(filemesh.urllib.request, "build_opener", return_value=opener):
+            with mock.patch.object(filemesh.time, "sleep") as sleep_mock:
+                with self.assertRaises(urllib.error.HTTPError):
+                    filemesh._fetch_url_response("https://example.test/mesh")
+
+        self.assertEqual(opener.calls, 1)
+        sleep_mock.assert_not_called()
+
     def test_parse_v4_skinning(self):
         parsed = parse_filemesh(_make_v4_mesh())
         self.assertEqual(parsed["version"], "version 4.00")
@@ -476,6 +592,12 @@ class TestFileMeshParsing(unittest.TestCase):
         self.assertEqual(parsed["faces"], [(0, 1, 1)])
         self.assertEqual(parsed["normals"][0], (0.0, 1.0, 0.0))
         self.assertEqual(parsed["uvs"][1], (0.0, 0.0))
+        self.assertEqual(parsed["tangent_bytes"][0], (127, 127, 0, 254))
+        self.assertEqual(parsed["tangents"][0], (0.0, 0.0, -1.0, 1.0))
+        self.assertEqual(parsed["tangent_signs"][0], 1.0)
+        self.assertEqual(parsed["tangent_sign_bytes"][0], 254)
+        self.assertEqual(parsed["color_bytes"][1], (255, 255, 255, 255))
+        self.assertEqual(parsed["colors"][1], (1.0, 1.0, 1.0, 1.0))
         self.assertAlmostEqual(parsed["vertex_weights"][0]["Root"], 1.0)
         self.assertAlmostEqual(parsed["vertex_weights"][1]["Jaw"], 1.0)
 
@@ -503,8 +625,28 @@ class TestFileMeshParsing(unittest.TestCase):
 
     def test_parse_v7_reads_lods_chunk_metadata(self):
         decoded_vertices = [
-            {"position": (0.0, 0.0, 0.0), "normal": (0.0, 1.0, 0.0), "uv": (0.0, 0.0)},
-            {"position": (1.0, 0.0, 0.0), "normal": (0.0, 1.0, 0.0), "uv": (1.0, 0.0)},
+            {
+                "position": (0.0, 0.0, 0.0),
+                "normal": (0.0, 1.0, 0.0),
+                "uv": (0.0, 0.0),
+                "tangent": (0.0, 0.0, -1.0, 1.0),
+                "tangent_bytes": (127, 127, 0, 254),
+                "tangent_sign": 1.0,
+                "tangent_sign_byte": 254,
+                "color": (1.0, 128.0 / 255.0, 0.0, 1.0),
+                "color_bytes": (255, 128, 0, 255),
+            },
+            {
+                "position": (1.0, 0.0, 0.0),
+                "normal": (0.0, 1.0, 0.0),
+                "uv": (1.0, 0.0),
+                "tangent": (0.0, 0.0, -1.0, 1.0),
+                "tangent_bytes": (127, 127, 0, 254),
+                "tangent_sign": 1.0,
+                "tangent_sign_byte": 254,
+                "color": (0.0, 128.0 / 255.0, 1.0, 1.0),
+                "color_bytes": (0, 128, 255, 255),
+            },
         ]
 
         with mock.patch.object(
@@ -520,8 +662,28 @@ class TestFileMeshParsing(unittest.TestCase):
 
     def test_parse_v7_uses_draco_geometry_when_decoder_available(self):
         decoded_vertices = [
-            {"position": (0.0, 0.0, 0.0), "normal": (0.0, 1.0, 0.0), "uv": (0.0, 0.0)},
-            {"position": (1.0, 0.0, 0.0), "normal": (0.0, 1.0, 0.0), "uv": (1.0, 0.0)},
+            {
+                "position": (0.0, 0.0, 0.0),
+                "normal": (0.0, 1.0, 0.0),
+                "uv": (0.0, 0.0),
+                "tangent": (0.0, 0.0, -1.0, 1.0),
+                "tangent_bytes": (127, 127, 0, 254),
+                "tangent_sign": 1.0,
+                "tangent_sign_byte": 254,
+                "color": (1.0, 128.0 / 255.0, 0.0, 1.0),
+                "color_bytes": (255, 128, 0, 255),
+            },
+            {
+                "position": (1.0, 0.0, 0.0),
+                "normal": (0.0, 1.0, 0.0),
+                "uv": (1.0, 0.0),
+                "tangent": (0.0, 0.0, -1.0, 1.0),
+                "tangent_bytes": (127, 127, 0, 254),
+                "tangent_sign": 1.0,
+                "tangent_sign_byte": 254,
+                "color": (0.0, 128.0 / 255.0, 1.0, 1.0),
+                "color_bytes": (0, 128, 255, 255),
+            },
         ]
 
         with mock.patch.object(
@@ -535,7 +697,70 @@ class TestFileMeshParsing(unittest.TestCase):
         self.assertEqual(parsed["positions"], [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)])
         self.assertEqual(parsed["normals"][0], (0.0, 1.0, 0.0))
         self.assertEqual(parsed["uvs"][1], (1.0, 0.0))
+        self.assertEqual(parsed["tangent_bytes"][0], (127, 127, 0, 254))
+        self.assertEqual(parsed["tangents"][0], (0.0, 0.0, -1.0, 1.0))
+        self.assertEqual(parsed["tangent_signs"][0], 1.0)
+        self.assertEqual(parsed["tangent_sign_bytes"][0], 254)
+        self.assertEqual(parsed["color_bytes"][1], (0, 128, 255, 255))
+        self.assertEqual(parsed["colors"][1], (0.0, 128.0 / 255.0, 1.0, 1.0))
         self.assertEqual(parsed["faces"], [(0, 1, 1)])
+
+    def test_parse_v7_rejects_trailing_draco_coremesh_payload(self):
+        coremesh = struct.pack("<I", 4) + b"DRCO" + b"x"
+        data = b"version 7.00\n" + b"COREMESH" + struct.pack("<II", 2, len(coremesh)) + coremesh
+
+        with self.assertRaisesRegex(ValueError, "unexpected trailing bytes"):
+            parse_filemesh(data)
+
+    def test_parse_v7_rejects_unreadable_draco_indices(self):
+        fake_dll = _FakeDracoDll(read_indices=False)
+
+        with mock.patch.object(filemesh, "_load_blender_draco_dll", return_value=fake_dll):
+            with self.assertRaisesRegex(RuntimeError, "indices but they could not be read"):
+                filemesh._decode_draco_coremesh_v2(struct.pack("<I", 4) + b"DRCO")
+
+    def test_parse_v7_rejects_short_draco_index_buffer(self):
+        fake_dll = _FakeDracoDll(index_byte_length=4)
+
+        with mock.patch.object(filemesh, "_load_blender_draco_dll", return_value=fake_dll):
+            with self.assertRaisesRegex(RuntimeError, "index buffer length"):
+                filemesh._decode_draco_coremesh_v2(struct.pack("<I", 4) + b"DRCO")
+
+    def test_parse_v7_rejects_out_of_range_draco_index(self):
+        fake_dll = _FakeDracoDll(index_values=(0, 1, 2))
+
+        with mock.patch.object(filemesh, "_load_blender_draco_dll", return_value=fake_dll):
+            with self.assertRaisesRegex(RuntimeError, "missing vertex"):
+                filemesh._decode_draco_coremesh_v2(struct.pack("<I", 4) + b"DRCO")
+
+    def test_parse_v7_rejects_skinning_coremesh_vertex_count_mismatch(self):
+        decoded_vertices = [
+            {
+                "position": (0.0, 0.0, 0.0),
+                "normal": None,
+                "uv": None,
+                "tangent": None,
+                "tangent_bytes": None,
+                "tangent_sign": None,
+                "tangent_sign_byte": None,
+                "color": None,
+                "color_bytes": None,
+            }
+        ]
+
+        with mock.patch.object(
+            filemesh,
+            "_decode_draco_coremesh_v2",
+            return_value=(decoded_vertices, [], 1),
+        ):
+            with self.assertRaisesRegex(ValueError, "skinning vertex count 2 does not match coremesh vertex count 1"):
+                parse_filemesh(_make_v7_mesh())
+
+    def test_parse_v6_rejects_truncated_chunk_payload(self):
+        data = b"version 6.00\n" + b"COREMESH" + struct.pack("<II", 1, 16) + b"abc"
+
+        with self.assertRaisesRegex(ValueError, "truncated COREMESH chunk payload"):
+            parse_filemesh(data)
 
     def test_parse_v5_facs_metadata(self):
         parsed = parse_filemesh(_make_v5_mesh())
@@ -741,6 +966,22 @@ class TestFileMeshParsing(unittest.TestCase):
             self.assertEqual(kwargs["apply_token"][2], ("frame", 12.0))
         finally:
             ui_properties._FACE_CONTROL_DEPSGRAPH_SEQUENCE = previous_sequence
+            ui_properties._FACE_CONTROL_DEPSGRAPH_APPLYING = previous_guard
+
+    def test_depsgraph_face_controls_handler_skips_during_playback(self):
+        scene = mock.Mock()
+        scene.frame_current_final = 12.0
+
+        previous_guard = ui_properties._FACE_CONTROL_DEPSGRAPH_APPLYING
+        ui_properties._FACE_CONTROL_DEPSGRAPH_APPLYING = False
+        try:
+            with mock.patch.object(ui_properties, "_face_controls_playback_active", return_value=True):
+                with mock.patch.object(ui_properties, "iter_active_facs_armatures", return_value=[mock.Mock()]):
+                    with mock.patch.object(ui_properties, "apply_facs_properties_to_armature") as apply_mock:
+                        ui_properties._depsgraph_face_controls_handler(scene, mock.Mock())
+
+            apply_mock.assert_not_called()
+        finally:
             ui_properties._FACE_CONTROL_DEPSGRAPH_APPLYING = previous_guard
 
     def test_parse_gzipped_filemesh(self):

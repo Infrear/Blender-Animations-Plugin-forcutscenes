@@ -50,6 +50,7 @@ Packages/
 scripts/
 dist/
 build/
+tools/
 
 # Temporary files
 *wally

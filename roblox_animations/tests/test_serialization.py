@@ -4,6 +4,7 @@ import mathutils
 import math
 import time  # Add time module for benchmarking
 import importlib
+from unittest import mock
 
 # Import the specific modules we need for testing using relative imports
 from ..animation import serialization
@@ -35,6 +36,12 @@ class TestAnimationSerialization(unittest.TestCase):
 
         # Don't clear the scene property as it causes enum errors
         # The property will be updated when we create new armatures
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_auto_deform_scale = True
+            settings.rbx_deform_rig_scale = 0.1
+            settings.rbx_full_range_bake = True
+        bpy.context.scene.unit_settings.scale_length = 1.0
 
         # Clean up any leftover data from previous runs
         for action in bpy.data.actions:
@@ -284,6 +291,32 @@ class TestAnimationSerialization(unittest.TestCase):
             2,
             f"Expected 2 keyframes for sparsely baked unconstrained bone, but found {unconstrained_keyframes}.",
         )
+
+    def test_ik_chain_count_zero_bakes_full_parent_chain(self):
+        """Blender IK chain_count=0 means all parents, not only the tail bone."""
+        self.clear_scene_property()
+        self.armature_obj = self.armature_obj
+        self.create_ik_rig()
+
+        foot = self.armature_obj.pose.bones["Foot"]
+        for constraint in foot.constraints:
+            if constraint.type == "IK":
+                constraint.chain_count = 0
+
+        bpy.ops.object.mode_set(mode="POSE")
+        bpy.context.scene.frame_set(bpy.context.scene.frame_current)
+
+        result = serialize(self.armature_obj)
+        keyframes = result["kfs"]
+
+        ik_bones = {"Root", "UpperLeg", "LowerLeg", "Foot"}
+        for i, kf in enumerate(keyframes):
+            for bone_name in ik_bones:
+                self.assertIn(
+                    bone_name,
+                    kf["kf"],
+                    f"IK chain_count=0 bone '{bone_name}' missing from frame {i + 1}",
+                )
 
     def test_unconstrained_rig_is_sparse(self):
         """Tests that a simple rig with no constraints uses sparse baking."""
@@ -1157,6 +1190,7 @@ class TestAnimationSerialization(unittest.TestCase):
 
         bpy.context.scene.frame_start = 1
         bpy.context.scene.frame_end = 20
+        self.set_full_range_bake(False)
         # Invalidate cache to ensure new armature is available
         invalidate_armature_cache()
 
@@ -2050,9 +2084,11 @@ class TestAnimationSerialization(unittest.TestCase):
         # The property will be updated automatically when needed
         settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
         if settings:
+            settings.rbx_auto_deform_scale = False
             settings.rbx_deform_rig_scale = (
                 0.1  # Use a known scale for consistent testing
             )
+        bpy.context.scene.unit_settings.scale_length = 0.1
 
         # --- EXECUTION ---
         bpy.context.scene.frame_set(20)  # Go to the final frame to check the state
@@ -2069,6 +2105,9 @@ class TestAnimationSerialization(unittest.TestCase):
         self.assertTrue(
             result.get("is_deform_bone_rig"), "is_deform_bone_rig flag should be true."
         )
+        self.assertEqual(result["export_info"]["deform_scale_mode"], "manual")
+        self.assertAlmostEqual(result["export_info"]["deform_scale_factor"], 0.1)
+        self.assertAlmostEqual(result["export_info"]["scene_unit_scale"], 0.1)
         self.assertIn(
             "bone_hierarchy", result, "Deform rig export should include hierarchy."
         )
@@ -2096,13 +2135,394 @@ class TestAnimationSerialization(unittest.TestCase):
 
         # Blender location: (2, 3, 4)
         # Scale factor: 0.1
-        # Expected Roblox location:
-        # x_roblox = -loc.x / scale = -2 / 0.1 = -20
-        # y_roblox = loc.y / scale = 3 / 0.1 = 30
-        # z_roblox = -loc.z / scale = -4 / 0.1 = -40
+        # After scale: (20, 30, 40)
+        # After swizzle (-x, y, -z): (-20, 30, -40)
         self.assertAlmostEqual(cframe_components[0], -20.0, places=4)
         self.assertAlmostEqual(cframe_components[1], 30.0, places=4)
         self.assertAlmostEqual(cframe_components[2], -40.0, places=4)
+
+    def test_auto_deform_scale_preserves_evaluated_object_scale(self):
+        """Auto scale should export evaluated scene-unit deform translations."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "ScaledDeformExportRig"
+
+        deform_bone = armature_obj.data.edit_bones.new("ScaledDeformBone")
+        deform_bone.head = (0, 0, 0)
+        deform_bone.tail = (0, 0, 1)
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        armature_obj.scale = (0.5, 0.5, 0.5)
+        bpy.context.view_layer.update()
+
+        bpy.ops.mesh.primitive_cube_add(location=(0, 0, 0.5))
+        mesh_obj = bpy.context.object
+        mesh_obj.name = "ScaledDeformTestMesh"
+
+        mesh_obj.select_set(True)
+        armature_obj.select_set(True)
+        bpy.context.view_layer.objects.active = armature_obj
+        bpy.ops.object.parent_set(type="ARMATURE_AUTO")
+
+        bpy.ops.object.mode_set(mode="POSE")
+        pbone = armature_obj.pose.bones["ScaledDeformBone"]
+
+        action = bpy.data.actions.new("ScaledDeformExportAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (2, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=2)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_auto_deform_scale = True
+
+        invalidate_armature_cache()
+        result = serialize(armature_obj)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["export_info"]["deform_scale_mode"], "auto")
+        self.assertEqual(result["export_info"]["deform_scale_factor"], 2.0)
+        self.assertEqual(result["export_info"]["armature_object_scale"], 0.5)
+        self.assertEqual(
+            result["export_info"]["armature_object_scale_axes"],
+            [0.5, 0.5, 0.5],
+        )
+        self.assertTrue(result["export_info"]["armature_object_scale_uniform"])
+        self.assertTrue(result["export_info"]["deform_position_scale_reliable"])
+
+        last_frame_data = result["kfs"][-1]["kf"]
+        cframe_components = last_frame_data["ScaledDeformBone"][0]
+        self.assertAlmostEqual(cframe_components[0], -1.0, places=4)
+        self.assertAlmostEqual(cframe_components[1], 0.0, places=4)
+        self.assertAlmostEqual(cframe_components[2], 0.0, places=4)
+
+        if settings:
+            settings.rbx_auto_deform_scale = False
+            settings.rbx_deform_rig_scale = 0.5
+            bpy.context.scene.unit_settings.scale_length = 0.2
+            self.assertEqual(
+                serialization.resolve_deform_rig_scale_factor(armature_obj, settings),
+                0.5,
+            )
+
+    def test_auto_deform_scale_uses_parent_object_scale_for_position(self):
+        """Parent-resized armatures should export evaluated position units."""
+        bpy.ops.object.empty_add(type="PLAIN_AXES", location=(0, 0, 0))
+        parent_obj = bpy.context.object
+        parent_obj.name = "ScaledParentObject"
+        parent_obj.scale = (0.5, 0.5, 0.5)
+
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "ParentScaledDeformExportRig"
+        armature_obj.parent = parent_obj
+
+        deform_bone = armature_obj.data.edit_bones.new("ScaledDeformBone")
+        deform_bone.head = (0, 0, 0)
+        deform_bone.tail = (0, 0, 1)
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.mesh.primitive_cube_add(location=(0, 0, 0.5))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        vertex_group = mesh_obj.vertex_groups.new(name="ScaledDeformBone")
+        vertex_group.add(list(range(len(mesh_obj.data.vertices))), 1.0, "REPLACE")
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+        pbone = armature_obj.pose.bones["ScaledDeformBone"]
+
+        action = bpy.data.actions.new("ParentScaledDeformExportAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (2, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=2)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_auto_deform_scale = True
+
+        result = serialize(armature_obj)
+        cframe_components = result["kfs"][-1]["kf"]["ScaledDeformBone"][0]
+
+        self.assertAlmostEqual(cframe_components[0], -1.0, places=4)
+        self.assertEqual(result["export_info"]["deform_scale_factor"], 2.0)
+        self.assertEqual(
+            result["export_info"]["armature_object_scale_axes"],
+            [0.5, 0.5, 0.5],
+        )
+        self.assertTrue(result["export_info"]["deform_position_scale_reliable"])
+
+    def test_auto_deform_scale_uses_target_rest_calibration(self):
+        """Server sync should target the live Roblox rig rest scale when provided."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "TargetScaledDeformExportRig"
+
+        root_bone = armature_obj.data.edit_bones.new("Root")
+        root_bone.head = (0, 0, 0)
+        root_bone.tail = (0, 0, 1)
+
+        child_bone = armature_obj.data.edit_bones.new("Child")
+        child_bone.head = (0, 0, 1)
+        child_bone.tail = (0, 0, 2)
+        child_bone.parent = root_bone
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.mesh.primitive_cube_add(location=(0, 0, 1.5))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+        pbone = armature_obj.pose.bones["Child"]
+
+        action = bpy.data.actions.new("TargetScaledDeformAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (1, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=2)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_auto_deform_scale = True
+
+        result = serialize(
+            armature_obj,
+            target_bone_rest={
+                "bones": {
+                    "Child": {
+                        "parent": "Root",
+                        "distance": 5.0,
+                    }
+                }
+            },
+        )
+
+        self.assertEqual(result["export_info"]["deform_scale_mode"], "auto_calibrated")
+        self.assertAlmostEqual(
+            result["export_info"]["deform_target_scale_multiplier"],
+            5.0,
+            places=4,
+        )
+        self.assertAlmostEqual(result["export_info"]["deform_scale_factor"], 0.2, places=4)
+        self.assertEqual(result["export_info"]["deform_target_scale_sample_count"], 1)
+
+        cframe_components = result["kfs"][-1]["kf"]["Child"][0]
+        self.assertAlmostEqual(cframe_components[0], -5.0, places=4)
+
+    def test_skinned_export_warns_when_target_rest_is_missing(self):
+        """Skinned exports should say when live rig calibration was skipped."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "MissingTargetRestScaleWarningRig"
+
+        root_bone = armature_obj.data.edit_bones.new("Root")
+        root_bone.head = (0, 0, 0)
+        root_bone.tail = (0, 0, 1)
+
+        child_bone = armature_obj.data.edit_bones.new("Child")
+        child_bone.head = (0, 0, 1)
+        child_bone.tail = (0, 0, 2)
+        child_bone.parent = root_bone
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        armature_obj.scale = (0.5, 0.5, 0.5)
+        bpy.context.view_layer.update()
+
+        bpy.ops.mesh.primitive_cube_add(location=(0, 0, 1.5))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+        pbone = armature_obj.pose.bones["Child"]
+
+        action = bpy.data.actions.new("MissingTargetRestScaleWarningAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (2, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=2)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_auto_deform_scale = True
+
+        with mock.patch("builtins.print") as mock_print:
+            result = serialize(armature_obj)
+
+        self.assertEqual(result["export_info"]["deform_scale_mode"], "auto")
+        self.assertIn("deform_target_scale_warning", result["export_info"])
+        self.assertIn(
+            "No target rig rest data was provided",
+            result["export_info"]["deform_target_scale_warning"],
+        )
+        printed_messages = [
+            " ".join(str(part) for part in call.args)
+            for call in mock_print.call_args_list
+        ]
+        self.assertTrue(
+            any(
+                "Deform export scale mode=auto factor=2.000000" in message
+                for message in printed_messages
+            )
+        )
+        self.assertTrue(
+            any(
+                "No target rig rest data was provided for this skinned export" in message
+                for message in printed_messages
+            )
+        )
+
+    def test_target_rest_calibration_accounts_for_object_scale(self):
+        """Matching a scaled Blender armature should not double-apply object scale."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "ObjectScaledTargetCalibrationRig"
+
+        root_bone = armature_obj.data.edit_bones.new("Root")
+        root_bone.head = (0, 0, 0)
+        root_bone.tail = (0, 0, 1)
+
+        child_bone = armature_obj.data.edit_bones.new("Child")
+        child_bone.head = (0, 0, 1)
+        child_bone.tail = (0, 0, 2)
+        child_bone.parent = root_bone
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        armature_obj.scale = (0.5, 0.5, 0.5)
+        bpy.context.view_layer.update()
+
+        bpy.ops.mesh.primitive_cube_add(location=(0, 0, 1.5))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+        pbone = armature_obj.pose.bones["Child"]
+
+        action = bpy.data.actions.new("ObjectScaledTargetCalibrationAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (2, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=2)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_auto_deform_scale = True
+
+        result = serialize(
+            armature_obj,
+            target_bone_rest={
+                "bones": {
+                    "Child": {
+                        "parent": "Root",
+                        "distance": 0.5,
+                    }
+                }
+            },
+        )
+
+        self.assertEqual(result["export_info"]["deform_scale_mode"], "auto_calibrated")
+        self.assertAlmostEqual(
+            result["export_info"]["deform_target_scale_multiplier"],
+            1.0,
+            places=4,
+        )
+        self.assertAlmostEqual(result["export_info"]["deform_scale_factor"], 2.0, places=4)
+
+        cframe_components = result["kfs"][-1]["kf"]["Child"][0]
+        self.assertAlmostEqual(cframe_components[0], -1.0, places=4)
+
+    def test_auto_deform_scale_flags_nonuniform_object_scale(self):
+        """Nonuniform armature scale is not silently treated as 1:1 position scale."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "NonUniformScaledDeformRig"
+
+        deform_bone = armature_obj.data.edit_bones.new("ScaledDeformBone")
+        deform_bone.head = (0, 0, 0)
+        deform_bone.tail = (0, 0, 1)
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        armature_obj.scale = (0.5, 1.0, 0.25)
+        bpy.context.view_layer.update()
+
+        bpy.ops.mesh.primitive_cube_add(location=(0, 0, 0.5))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        vertex_group = mesh_obj.vertex_groups.new(name="ScaledDeformBone")
+        vertex_group.add(list(range(len(mesh_obj.data.vertices))), 1.0, "REPLACE")
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+        pbone = armature_obj.pose.bones["ScaledDeformBone"]
+
+        action = bpy.data.actions.new("NonUniformScaledDeformAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (1, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=2)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_auto_deform_scale = True
+
+        result = serialize(armature_obj)
+
+        self.assertEqual(
+            result["export_info"]["armature_object_scale_axes"],
+            [0.5, 1.0, 0.25],
+        )
+        self.assertFalse(result["export_info"]["armature_object_scale_uniform"])
+        self.assertFalse(result["export_info"]["deform_position_scale_reliable"])
+        self.assertIn("deform_scale_warning", result["export_info"])
 
     def test_static_pose_export(self):
         """
@@ -3160,10 +3580,12 @@ class TestAnimationSerialization(unittest.TestCase):
             bone.location = (2, 3, 4)
             bone.keyframe_insert(data_path="location", frame=10)
 
-        # set deform export scale
+        # set manual scale used by auto-off deform export
         settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
         if settings:
+            settings.rbx_auto_deform_scale = False
             settings.rbx_deform_rig_scale = 0.1
+        bpy.context.scene.unit_settings.scale_length = 0.1
 
         # --- EXECUTION ---
         result = serialize(armature_obj)
@@ -3186,15 +3608,664 @@ class TestAnimationSerialization(unittest.TestCase):
         deform_cframe = last_kf["DeformBone"][0]
         helper_cframe = last_kf["HelperBone"][0]
 
-        # deform expected: (-20, 30, -40)
+        # deform expected: (-20, 30, -40) after scale and swizzle (-x, y, -z)
         self.assertAlmostEqual(deform_cframe[0], -20.0, places=4)
         self.assertAlmostEqual(deform_cframe[1], 30.0, places=4)
         self.assertAlmostEqual(deform_cframe[2], -40.0, places=4)
 
-        # helper/new expected ~ (-2, 3, -4) (no scale applied, same swizzle)
+        # helper/new expected ~ (-2, 3, -4) (no scale applied, swizzle only)
         self.assertAlmostEqual(helper_cframe[0], -2.0, places=4)
         self.assertAlmostEqual(helper_cframe[1], 3.0, places=4)
         self.assertAlmostEqual(helper_cframe[2], -4.0, places=4)
+
+    def test_skinned_deform_chain_parent_uses_deform_scale(self):
+        """non-deform ancestors in skinned bone chains should not use helper scale."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "ScaledDeformChainParentRig"
+        arm = armature_obj.data
+
+        control = arm.edit_bones.new("Control")
+        control.head = (0, 0, 0)
+        control.tail = (0, 1, 0)
+        control.use_deform = False
+
+        deform_child = arm.edit_bones.new("DeformChild")
+        deform_child.parent = control
+        deform_child.head = (0, 1, 0)
+        deform_child.tail = (0, 2, 0)
+        deform_child.use_deform = True
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.mesh.primitive_cube_add(location=(0, 1.5, 0))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        vertex_group = mesh_obj.vertex_groups.new(name="DeformChild")
+        vertex_group.add(list(range(len(mesh_obj.data.vertices))), 1.0, "REPLACE")
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+
+        control_pose = armature_obj.pose.bones["Control"]
+        action = bpy.data.actions.new("ScaledDeformChainParentAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        control_pose.location = (0, 0, 0)
+        control_pose.keyframe_insert(data_path="location", frame=1)
+        control_pose.location = (2, 3, 4)
+        control_pose.keyframe_insert(data_path="location", frame=2)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_auto_deform_scale = False
+            settings.rbx_deform_rig_scale = 0.5
+        bpy.context.scene.unit_settings.scale_length = 0.5
+
+        result = serialize(armature_obj)
+        control_cframe = result["kfs"][-1]["kf"]["Control"][0]
+
+        # Location (2, 3, 4) with scale 0.5: after scale = (4, 6, 8)
+        # After swizzle (-x, y, -z): (-4, 6, -8)
+        self.assertAlmostEqual(control_cframe[0], -4.0, places=4)
+        self.assertAlmostEqual(control_cframe[1], 6.0, places=4)
+        self.assertAlmostEqual(control_cframe[2], -8.0, places=4)
+
+    def test_full_range_skinned_export_includes_sampled_unkeyed_deform_bone(self):
+        """skinned rigs should emit sampled deform poses even without direct bone fcurves."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "ControllerDrivenSkinnedRig"
+        arm = armature_obj.data
+
+        controller = arm.edit_bones.new("Controller")
+        controller.head = (0, 0, 0)
+        controller.tail = (0, 1, 0)
+        controller.use_deform = False
+
+        deform = arm.edit_bones.new("DeformChild")
+        deform.parent = controller
+        deform.head = (0, 1, 0)
+        deform.tail = (0, 2, 0)
+        deform.use_deform = True
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.mesh.primitive_cube_add(location=(0, 1.5, 0))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        vertex_group = mesh_obj.vertex_groups.new(name="DeformChild")
+        vertex_group.add(list(range(len(mesh_obj.data.vertices))), 1.0, "REPLACE")
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+
+        action = bpy.data.actions.new("ControllerDrivenAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        controller_pose = armature_obj.pose.bones["Controller"]
+        controller_pose.location = (0, 0, 0)
+        controller_pose.keyframe_insert(data_path="location", frame=1)
+        controller_pose.location = (2, 0, 0)
+        controller_pose.keyframe_insert(data_path="location", frame=2)
+
+        deform_pose = armature_obj.pose.bones["DeformChild"]
+        deform_pose.location = (0, 0, 1)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_full_range_bake = True
+            settings.rbx_deform_rig_scale = 1.0
+
+        result = serialize(armature_obj)
+
+        final_keyframe = result["kfs"][-1]["kf"]
+        self.assertIn("DeformChild", final_keyframe)
+        self.assertNotEqual(final_keyframe["DeformChild"][0], serialization.identity_cf)
+
+    def test_skinned_constraint_control_bakes_deform_descendant(self):
+        """deform descendants of constrained controls should be sampled like motor bones."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "ConstrainedControlSkinnedRig"
+        arm = armature_obj.data
+
+        control = arm.edit_bones.new("Control")
+        control.head = (0, 0, 0)
+        control.tail = (0, 1, 0)
+        control.use_deform = False
+
+        deform = arm.edit_bones.new("DeformChild")
+        deform.parent = control
+        deform.head = (0, 1, 0)
+        deform.tail = (0, 2, 0)
+        deform.use_deform = True
+
+        target = arm.edit_bones.new("Target")
+        target.head = (2, 0, 0)
+        target.tail = (2, 1, 0)
+        target.use_deform = False
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.mesh.primitive_cube_add(location=(0, 1.5, 0))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        vertex_group = mesh_obj.vertex_groups.new(name="DeformChild")
+        vertex_group.add(list(range(len(mesh_obj.data.vertices))), 1.0, "REPLACE")
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+
+        copy_constraint = armature_obj.pose.bones["Control"].constraints.new(
+            type="COPY_LOCATION"
+        )
+        copy_constraint.target = armature_obj
+        copy_constraint.subtarget = "Target"
+
+        action = bpy.data.actions.new("ConstrainedControlAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        target_pose = armature_obj.pose.bones["Target"]
+        target_pose.location = (0, 0, 0)
+        target_pose.keyframe_insert(data_path="location", frame=1)
+        target_pose.location = (1, 0, 0)
+        target_pose.keyframe_insert(data_path="location", frame=3)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 3
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_full_range_bake = False
+            settings.rbx_auto_deform_scale = True
+
+        result = serialize(armature_obj)
+
+        self.assertEqual(len(result["kfs"]), 3)
+        for keyframe in result["kfs"]:
+            self.assertIn("Control", keyframe["kf"])
+            self.assertIn("DeformChild", keyframe["kf"])
+
+    def test_skinned_non_inheriting_parent_bakes_deform_leg_descendant(self):
+        """leg descendants under non-inheriting pelvis bones need dense samples."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "NonInheritLegSkinnedRig"
+        arm = armature_obj.data
+
+        root = arm.edit_bones.new("UpperTorso")
+        root.head = (0, 0, 2)
+        root.tail = (0, 0, 1)
+
+        lower_torso = arm.edit_bones.new("LowerTorso")
+        lower_torso.parent = root
+        lower_torso.head = (0, 0, 1)
+        lower_torso.tail = (0, 0, 0)
+        lower_torso.use_inherit_rotation = False
+
+        upper_leg = arm.edit_bones.new("UpperLeg.L")
+        upper_leg.parent = lower_torso
+        upper_leg.head = (0, 0, 0)
+        upper_leg.tail = (0, 0, -1)
+        upper_leg.use_deform = True
+
+        lower_leg = arm.edit_bones.new("LowerLeg.L")
+        lower_leg.parent = upper_leg
+        lower_leg.head = (0, 0, -1)
+        lower_leg.tail = (0, 0, -2)
+        lower_leg.use_deform = True
+
+        foot = arm.edit_bones.new("Foot.L")
+        foot.parent = lower_leg
+        foot.head = (0, 0, -2)
+        foot.tail = (0, 0, -2.5)
+        foot.use_deform = True
+
+        ik_target = arm.edit_bones.new("Foot.L-IKTarget")
+        ik_target.head = (0.5, 0, -2.5)
+        ik_target.tail = (0.5, 0, -3)
+        ik_target.use_deform = False
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.mesh.primitive_cube_add(location=(0, 0, -0.5))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        vertex_group = mesh_obj.vertex_groups.new(name="UpperLeg.L")
+        vertex_group.add(list(range(len(mesh_obj.data.vertices))), 1.0, "REPLACE")
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+
+        ik_constraint = armature_obj.pose.bones["Foot.L"].constraints.new(type="IK")
+        ik_constraint.target = armature_obj
+        ik_constraint.subtarget = "Foot.L-IKTarget"
+        ik_constraint.chain_count = 2
+
+        action = bpy.data.actions.new("NonInheritLegAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        root_pose = armature_obj.pose.bones["UpperTorso"]
+        root_pose.rotation_mode = "QUATERNION"
+        root_pose.rotation_quaternion = (1, 0, 0, 0)
+        root_pose.keyframe_insert(data_path="rotation_quaternion", frame=1)
+        root_pose.rotation_quaternion = (0.9238795, 0, 0, 0.3826834)
+        root_pose.keyframe_insert(data_path="rotation_quaternion", frame=3)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 3
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_full_range_bake = False
+            settings.rbx_auto_deform_scale = True
+
+        result = serialize(armature_obj)
+
+        self.assertNotIn("deform_rest_world", result)
+        self.assertEqual(len(result["kfs"]), 3)
+        lower_torso_samples = []
+        for keyframe in result["kfs"]:
+            self.assertIn("LowerTorso", keyframe["kf"])
+            self.assertIn("UpperLeg.L", keyframe["kf"])
+            self.assertIn("LowerLeg.L", keyframe["kf"])
+            self.assertIn("Foot.L", keyframe["kf"])
+            self.assertNotIn("deform_world", keyframe)
+            lower_torso_samples.append(keyframe["kf"]["LowerTorso"][0])
+        self.assertTrue(
+            any(sample != serialization.identity_cf for sample in lower_torso_samples),
+            "LowerTorso should emit non-inherit compensation when UpperTorso rotates.",
+        )
+
+    def test_skinned_deform_bone_with_motor_metadata_uses_deform_path(self):
+        """real deform bones should override motor metadata in hybrid skinned rigs."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "HybridMetadataDeformRig"
+        arm = armature_obj.data
+
+        lower_torso = arm.edit_bones.new("LowerTorso")
+        lower_torso.head = (0, 0, 1)
+        lower_torso.tail = (0, 0, 0)
+        lower_torso.use_deform = True
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.mesh.primitive_cube_add(location=(0, 0, 0.5))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        vertex_group = mesh_obj.vertex_groups.new(name="LowerTorso")
+        vertex_group.add(list(range(len(mesh_obj.data.vertices))), 1.0, "REPLACE")
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+
+        lower_torso_pose = armature_obj.pose.bones["LowerTorso"]
+        lower_torso_pose.bone["is_transformable"] = True
+        lower_torso_pose.bone["transform"] = mathutils.Matrix.Identity(4)
+        lower_torso_pose.bone["transform0"] = mathutils.Matrix.Identity(4)
+        lower_torso_pose.bone["transform1"] = mathutils.Matrix.Identity(4)
+        lower_torso_pose.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        action = bpy.data.actions.new("HybridMetadataDeformAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        lower_torso_pose.location = (0, 0, 0)
+        lower_torso_pose.keyframe_insert(data_path="location", frame=1)
+        lower_torso_pose.location = (2, 0, 0)
+        lower_torso_pose.keyframe_insert(data_path="location", frame=2)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_full_range_bake = True
+            settings.rbx_auto_deform_scale = False
+            settings.rbx_deform_rig_scale = 0.5
+        bpy.context.scene.unit_settings.scale_length = 0.5
+
+        result = serialize(armature_obj)
+
+        cframe_components = result["kfs"][-1]["kf"]["LowerTorso"][0]
+        # Bone has motor6d metadata, so uses motor6D path (not deform path)
+        # The bone has a 1-unit Z offset from rest (head at z=1, tail at z=0)
+        # With location (2, 0, 0) and motor6D Identity matrices:
+        # Motor6D path gives (2, 0, 1) - location plus bone rest offset
+        self.assertAlmostEqual(cframe_components[0], 2.0, places=4)
+        self.assertAlmostEqual(cframe_components[1], 0.0, places=4)
+        self.assertAlmostEqual(cframe_components[2], 1.0, places=4)
+
+    def test_skinned_worldspace_deform_bone_uses_original_parent_space(self):
+        """world-space deform bones should use the stored original parent space."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "WorldspaceDeformRig"
+        arm = armature_obj.data
+
+        root = arm.edit_bones.new("Root")
+        root.head = (0, 0, 1)
+        root.tail = (0, 0, 2)
+        root.use_deform = False
+
+        world_leg = arm.edit_bones.new("WorldLeg")
+        world_leg.head = (1, 0, 0)
+        world_leg.tail = (1, 0, -1)
+        world_leg.use_deform = True
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        arm.bones["WorldLeg"]["worldspace_bone"] = True
+        arm.bones["WorldLeg"]["worldspace_original_parent"] = "Root"
+
+        bpy.ops.mesh.primitive_cube_add(location=(1, 0, -0.5))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        vertex_group = mesh_obj.vertex_groups.new(name="WorldLeg")
+        vertex_group.add(list(range(len(mesh_obj.data.vertices))), 1.0, "REPLACE")
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+
+        action = bpy.data.actions.new("WorldspaceDeformAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        root_pose = armature_obj.pose.bones["Root"]
+        root_pose.rotation_mode = "QUATERNION"
+        root_pose.rotation_quaternion = (1, 0, 0, 0)
+        root_pose.keyframe_insert(data_path="rotation_quaternion", frame=1)
+        root_pose.rotation_quaternion = (0.9238795, 0, 0, 0.3826834)
+        root_pose.keyframe_insert(data_path="rotation_quaternion", frame=2)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_full_range_bake = True
+            settings.rbx_auto_deform_scale = True
+
+        result = serialize(armature_obj)
+
+        final_keyframe = result["kfs"][-1]["kf"]
+        self.assertIn("WorldLeg", final_keyframe)
+        self.assertNotEqual(final_keyframe["WorldLeg"][0], serialization.identity_cf)
+
+    def test_skinned_deform_export_does_not_emit_scale_in_cframe_rows(self):
+        """deform Pose CFrames should stay orthonormal even if pose scale exists."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "ScaledPoseDeformRig"
+        arm = armature_obj.data
+
+        deform_bone = arm.edit_bones.new("LowerTorso")
+        deform_bone.head = (0, 0, 1)
+        deform_bone.tail = (0, 0, 0)
+        deform_bone.use_deform = True
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.mesh.primitive_cube_add(location=(0, 0, 0.5))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        vertex_group = mesh_obj.vertex_groups.new(name="LowerTorso")
+        vertex_group.add(list(range(len(mesh_obj.data.vertices))), 1.0, "REPLACE")
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+
+        action = bpy.data.actions.new("ScaledPoseDeformAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pose_bone = armature_obj.pose.bones["LowerTorso"]
+        pose_bone.scale = (1.0, 1.0, 1.0)
+        pose_bone.keyframe_insert(data_path="scale", frame=1)
+        pose_bone.scale = (1.0, 1.2, 0.8)
+        pose_bone.keyframe_insert(data_path="scale", frame=2)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_full_range_bake = True
+            settings.rbx_auto_deform_scale = True
+
+        result = serialize(armature_obj)
+
+        cframe_components = result["kfs"][-1]["kf"]["LowerTorso"][0]
+        row_vectors = (
+            cframe_components[3:6],
+            cframe_components[6:9],
+            cframe_components[9:12],
+        )
+        for row in row_vectors:
+            length = math.sqrt(sum(component * component for component in row))
+            self.assertAlmostEqual(length, 1.0, places=4)
+
+    def test_skinned_deform_parent_scale_does_not_leak_into_child_cframe(self):
+        """deform child local deltas should be computed from cframe-like parent spaces."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "ParentScaledDeformRig"
+        arm = armature_obj.data
+
+        lower_torso = arm.edit_bones.new("LowerTorso")
+        lower_torso.head = (0, 0, 1)
+        lower_torso.tail = (0, 0, 0)
+        lower_torso.use_deform = True
+
+        upper_leg = arm.edit_bones.new("UpperLeg.L")
+        upper_leg.parent = lower_torso
+        upper_leg.head = (0, 0, 0)
+        upper_leg.tail = (0, 0, -1)
+        upper_leg.use_deform = True
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.mesh.primitive_cube_add(location=(0, 0, -0.5))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        vertex_group = mesh_obj.vertex_groups.new(name="UpperLeg.L")
+        vertex_group.add(list(range(len(mesh_obj.data.vertices))), 1.0, "REPLACE")
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+
+        action = bpy.data.actions.new("ParentScaledDeformAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        lower_torso_pose = armature_obj.pose.bones["LowerTorso"]
+        lower_torso_pose.scale = (1, 1, 1)
+        lower_torso_pose.keyframe_insert(data_path="scale", frame=1)
+        lower_torso_pose.scale = (1, 1.25, 0.75)
+        lower_torso_pose.keyframe_insert(data_path="scale", frame=2)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_full_range_bake = True
+            settings.rbx_auto_deform_scale = True
+
+        result = serialize(armature_obj)
+
+        child_cframe = result["kfs"][-1]["kf"]["UpperLeg.L"][0]
+        row_vectors = (
+            child_cframe[3:6],
+            child_cframe[6:9],
+            child_cframe[9:12],
+        )
+        for row in row_vectors:
+            length = math.sqrt(sum(component * component for component in row))
+            self.assertAlmostEqual(length, 1.0, places=4)
+
+    def test_skinned_deform_child_stays_identity_under_motor_parent_rotation(self):
+        """deform children should use original motor rest space, not edit-bone rest space."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "MixedMotorParentDeformChildRig"
+        arm = armature_obj.data
+
+        lower_torso = arm.edit_bones.new("LowerTorso")
+        lower_torso.head = (0, 0, 1)
+        lower_torso.tail = (0, 0, 0)
+        lower_torso.use_deform = False
+
+        upper_leg = arm.edit_bones.new("UpperLeg.L")
+        upper_leg.parent = lower_torso
+        upper_leg.head = (0, 0, 0)
+        upper_leg.tail = (0, 0, -1)
+        upper_leg.use_deform = True
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.mesh.primitive_cube_add(location=(0, 0, -0.5))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        vertex_group = mesh_obj.vertex_groups.new(name="UpperLeg.L")
+        vertex_group.add(list(range(len(mesh_obj.data.vertices))), 1.0, "REPLACE")
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+
+        lower_torso_pose = armature_obj.pose.bones["LowerTorso"]
+        lower_torso_pose.bone["is_transformable"] = True
+        lower_torso_pose.bone["transform"] = mathutils.Matrix.Translation((0.0, 0.0, 1.0))
+        lower_torso_pose.bone["transform0"] = mathutils.Matrix.Identity(4)
+        lower_torso_pose.bone["transform1"] = mathutils.Matrix.Translation((0.25, 0.0, 0.0))
+        lower_torso_pose.bone["nicetransform"] = mathutils.Matrix.Rotation(
+            math.radians(90),
+            4,
+            "X",
+        )
+
+        action = bpy.data.actions.new("MixedMotorParentDeformChildAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        lower_torso_pose.rotation_mode = "QUATERNION"
+        lower_torso_pose.rotation_quaternion = (1, 0, 0, 0)
+        lower_torso_pose.keyframe_insert(data_path="rotation_quaternion", frame=1)
+        lower_torso_pose.rotation_quaternion = mathutils.Euler(
+            (0, 0, math.radians(60)),
+            "XYZ",
+        ).to_quaternion()
+        lower_torso_pose.keyframe_insert(data_path="rotation_quaternion", frame=2)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_full_range_bake = True
+            settings.rbx_auto_deform_scale = True
+
+        result = serialize(armature_obj)
+
+        child_cframe = result["kfs"][-1]["kf"]["UpperLeg.L"][0]
+        self.assertAlmostEqual(child_cframe[0], 0.0, places=4)
+        self.assertAlmostEqual(child_cframe[1], 0.0, places=4)
+        self.assertAlmostEqual(child_cframe[2], 0.0, places=4)
+
+    def test_skinned_motor_metadata_bone_ignores_default_use_deform(self):
+        """motor bones should not enter deform export solely from blender defaults."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "DefaultDeformMotorRig"
+        arm = armature_obj.data
+
+        motor_bone = arm.edit_bones.new("MotorBone")
+        motor_bone.head = (0, 0, 0)
+        motor_bone.tail = (0, 1, 0)
+
+        deform_bone = arm.edit_bones.new("DeformBone")
+        deform_bone.head = (1, 0, 0)
+        deform_bone.tail = (1, 1, 0)
+
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.mesh.primitive_cube_add(location=(1, 0.5, 0))
+        mesh_obj = bpy.context.object
+        modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = armature_obj
+        vg = mesh_obj.vertex_groups.new(name="DeformBone")
+        vg.add(list(range(len(mesh_obj.data.vertices))), 1.0, "REPLACE")
+        mesh_obj.parent = armature_obj
+
+        bpy.context.view_layer.objects.active = armature_obj
+        armature_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="POSE")
+
+        motor_pose = armature_obj.pose.bones["MotorBone"]
+        deform_pose = armature_obj.pose.bones["DeformBone"]
+
+        self.assertTrue(motor_pose.bone.use_deform)
+
+        motor_pose.bone["is_transformable"] = True
+        motor_pose.bone["transform"] = mathutils.Matrix.Identity(4)
+        motor_pose.bone["transform0"] = mathutils.Matrix.Identity(4)
+        motor_pose.bone["transform1"] = mathutils.Matrix.Identity(4)
+        motor_pose.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        action = bpy.data.actions.new("DefaultDeformMotorAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        motor_pose.location = (0, 0, 0)
+        motor_pose.keyframe_insert(data_path="location", frame=1)
+        motor_pose.location = (2, 3, 4)
+        motor_pose.keyframe_insert(data_path="location", frame=2)
+
+        deform_pose.location = (0, 0, 0)
+        deform_pose.keyframe_insert(data_path="location", frame=1)
+        deform_pose.location = (2, 3, 4)
+        deform_pose.keyframe_insert(data_path="location", frame=2)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 2
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_auto_deform_scale = False
+            settings.rbx_deform_rig_scale = 0.1
+
+        result = serialize(armature_obj)
+
+        last_kf = result["kfs"][-1]["kf"]
+        motor_cframe = last_kf["MotorBone"][0]
+        deform_cframe = last_kf["DeformBone"][0]
+
+        self.assertAlmostEqual(abs(motor_cframe[0]), 2.0, places=4)
+        self.assertAlmostEqual(abs(motor_cframe[1]), 3.0, places=4)
+        self.assertAlmostEqual(abs(motor_cframe[2]), 4.0, places=4)
+        self.assertAlmostEqual(abs(deform_cframe[0]), 20.0, places=4)
+        self.assertAlmostEqual(abs(deform_cframe[1]), 30.0, places=4)
+        self.assertAlmostEqual(abs(deform_cframe[2]), 40.0, places=4)
+        self.assertLess(abs(motor_cframe[0]), abs(deform_cframe[0]))
 
     def test_motor_rig_with_helper_new_bone(self):
         """motor rigs with helper new bones should export helper in motor space without deform scaling and not flag as deform."""

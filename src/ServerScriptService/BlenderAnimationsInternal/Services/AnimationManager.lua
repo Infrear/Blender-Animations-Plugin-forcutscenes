@@ -7,6 +7,7 @@ local Types = require(script.Parent.Parent.types)
 local Utils = require(script.Parent.Parent.Utils)
 
 local AnimationSerializer = require(script.Parent.Parent.Components.AnimationSerializer)
+local AnimationSimplifier = require(script.Parent.Parent.Components.AnimationSimplifier)
 local SelectionService = game:GetService("Selection")
 
 local AnimationManager = {}
@@ -505,6 +506,102 @@ function AnimationManager:displayDetailedError(title, message)
 	warn(title, message)
 end
 
+local function ensureActiveRigReady(progressContext: LoadingProgressContext?): boolean
+	local activeRig = State.activeRig :: any
+	if activeRig and type(activeRig.LoadAnimation) == "function" then
+		return true
+	end
+
+	local rigModel = State.activeRigModel or State.lastKnownRigModel
+	if not rigModel then
+		warn("No rig model available to rebuild active rig.")
+		return false
+	end
+
+	local rigManager = State.rigManager
+	if not rigManager or type(rigManager.setRig) ~= "function" then
+		warn("RigManager unavailable; cannot rebuild active rig.")
+		return false
+	end
+
+	if progressContext then
+		progressContext:set(0.05, "Preparing rig preview", "rebuilding selected rig", false)
+	end
+
+	local ok, err = pcall(function()
+		rigManager:setRig(rigModel)
+	end)
+	if not ok then
+		warn("Failed to rebuild active rig:", err)
+		return false
+	end
+
+	activeRig = State.activeRig :: any
+	if not activeRig or type(activeRig.LoadAnimation) ~= "function" then
+		warn("Active rig is still unavailable after rebuild.")
+		return false
+	end
+
+	return true
+end
+
+local SIMPLIFIER_MAX_DROP_RATIO = 0.75
+local SIMPLIFIER_STRENGTH_CURVE = 0.9
+
+local function getSimplifierKeepRatio(strength: number): number
+	local t = math.clamp(strength / 100, 0, 1)
+	if t <= 0 then
+		return 1
+	end
+
+	return math.clamp(1 - SIMPLIFIER_MAX_DROP_RATIO * (t ^ SIMPLIFIER_STRENGTH_CURVE), 0.25, 1)
+end
+
+local function applySimplifier(animData)
+	local simplifierEnabled = State.simplifierEnabled:get()
+	local simplifierStrength = State.simplifierStrength:get()
+	if not simplifierEnabled or simplifierStrength <= 0 or type(animData) ~= "table" or type(animData.kfs) ~= "table" then
+		return animData
+	end
+
+	local originalKfCount = #animData.kfs
+
+	-- Nonlinear mapping keeps low settings gentle while making high settings useful:
+	--   strength=15  -> keep ~86% of frames (drop ~14%)
+	--   strength=50  -> keep ~60% of frames (drop ~40%)
+	--   strength=100 -> keep ~25% of frames (drop ~75%, min 2)
+	local keepRatio = getSimplifierKeepRatio(simplifierStrength)
+	local targetCount = math.max(2, math.floor(originalKfCount * keepRatio))
+
+	-- Can't simplify if target is same or larger than original
+	if targetCount >= originalKfCount then
+		return animData
+	end
+
+	local simplified, summary = AnimationSimplifier.simplify(animData, {
+		targetCount = targetCount,
+		decimalPlaces = 4,
+		skipStaticBones = true,
+		skipEmptyCleanup = true,
+	})
+
+	if simplified then
+		local newKfCount = #simplified.kfs
+		print(string.format(
+			"[AnimationManager] Simplifier: strength=%d, keepRatio=%.0f%%, targetCount=%d, kfs: %d -> %d. %s",
+			simplifierStrength,
+			keepRatio * 100,
+			targetCount,
+			originalKfCount,
+			newKfCount,
+			summary
+		))
+		return simplified
+	end
+
+	return animData
+end
+
 function AnimationManager:loadAnim(data: string, isBinary: boolean, progressContext: LoadingProgressContext?)
 	local decodeProgress = if progressContext then progressContext:child(0, 0.985) else nil
 	local applyProgress = if progressContext then progressContext:child(0.985, 1) else nil
@@ -521,6 +618,15 @@ function AnimationManager:loadAnim(data: string, isBinary: boolean, progressCont
 	if not animData then
 		error("Failed to deserialize animation data.")
 	end
+	
+	-- Store raw deserialized data for re-simplification on slider changes
+	self.lastRawAnimData = animData
+	State.lastRawAnimData:set(animData)
+
+	-- Apply simplifier based on user settings
+	animData = applySimplifier(animData)
+
+	State.currentAnimationData:set(animData)
 
 	if progressContext then
 		progressContext:set(
@@ -537,7 +643,7 @@ function AnimationManager:loadAnim(data: string, isBinary: boolean, progressCont
 
 	-- Load the animation
 	local _loadSuccess, loadError = pcall(function()
-		assert(State.activeRig, "activeRig is nil")
+		assert(ensureActiveRigReady(applyProgress), "activeRig is not ready; select a valid rig and wait for rig setup to finish")
 		local activeRig = State.activeRig :: any
 		activeRig:LoadAnimation(
 			animData,
@@ -559,6 +665,60 @@ function AnimationManager:loadAnim(data: string, isBinary: boolean, progressCont
 	end
 
 	return animData
+end
+
+--[[
+	Re-simplifies the last loaded raw animation data with current simplifier settings
+	and reloads the animation into the rig. Called when the user adjusts the simplifier
+	slider or toggles the simplifier checkbox.
+]]
+local function deepCopy(t: any): any
+	if type(t) ~= "table" then
+		return t
+	end
+	local copy = {}
+	for k, v in pairs(t) do
+		copy[deepCopy(k)] = deepCopy(v)
+	end
+	return copy
+end
+
+function AnimationManager:resimplifyAndPlay()
+	local rawData = self.lastRawAnimData
+	if not rawData then
+		return false
+	end
+
+	local copied = deepCopy(rawData)
+
+	-- Apply simplifier based on current user settings
+	local animData = applySimplifier(copied)
+
+	State.currentAnimationData:set(animData)
+
+	-- Reload into rig
+	local rig = State.activeRig
+	if not rig then
+		warn("No active rig to reload simplified animation")
+		return false
+	end
+
+	local success, loadError = pcall(function()
+		rig:LoadAnimation(animData)
+		return true
+	end)
+
+	if not success then
+		warn("Failed to reload simplified animation: " .. tostring(loadError))
+		return false
+	end
+
+	-- Rebuild and play
+	if self.playbackService and State.activeAnimator then
+		self.playbackService:playCurrentAnimation(State.activeAnimator)
+	end
+
+	return true
 end
 
 function AnimationManager:loadAnimDataFromText(text: string, isBinary: boolean, options: LoadOptions?)
@@ -669,43 +829,6 @@ local function syncRigAnimationFromKeyframeSequence(animationSerializerService, 
 	end
 
 	rig:LoadAnimation(animData)
-end
-
-local function ensureActiveRigReady(progressContext: LoadingProgressContext?): boolean
-	if State.activeRig then
-		return true
-	end
-
-	local rigModel = State.activeRigModel or State.lastKnownRigModel
-	if not rigModel then
-		warn("No rig model available to rebuild active rig.")
-		return false
-	end
-
-	local rigManager = State.rigManager
-	if not rigManager or type(rigManager.setRig) ~= "function" then
-		warn("RigManager unavailable; cannot rebuild active rig.")
-		return false
-	end
-
-	if progressContext then
-		progressContext:set(0.05, "Preparing rig preview", "rebuilding selected rig", false)
-	end
-
-	local ok, err = pcall(function()
-		rigManager:setRig(rigModel)
-	end)
-	if not ok then
-		warn("Failed to rebuild active rig:", err)
-		return false
-	end
-
-	if not State.activeRig then
-		warn("Active rig is still unavailable after rebuild.")
-		return false
-	end
-
-	return true
 end
 
 function AnimationManager:loadRig(animationToLoad: KeyframeSequence?, progressContext: LoadingProgressContext?)
@@ -1170,7 +1293,29 @@ function AnimationManager:playSavedAnimation(animation)
 
 	if self:loadRig(keyframeSequence) == false then
 		warn("Failed to play saved animation because the active rig is not ready yet.")
+		return
 	end
+
+	local activeRig = State.activeRig :: any
+	if not activeRig then
+		return
+	end
+
+	local animData = self.animationSerializerService:serialize(keyframeSequence, activeRig)
+	if not animData then
+		warn("Failed to serialize saved animation for simplification")
+		return
+	end
+
+	-- Store raw deserialized data for re-simplification on slider changes
+	self.lastRawAnimData = animData
+	State.lastRawAnimData:set(animData)
+
+	-- Apply simplifier based on user settings
+	animData = applySimplifier(animData)
+
+	State.currentAnimationData:set(animData)
+	activeRig:LoadAnimation(animData)
 end
 
 function AnimationManager:importAnimationsBulk()

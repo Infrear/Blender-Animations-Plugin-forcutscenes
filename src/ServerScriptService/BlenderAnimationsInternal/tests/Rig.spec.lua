@@ -564,6 +564,53 @@ return function()
 			expect(rig.bones["ArmBone"]).to.be.ok()
 		end)
 
+		it("should bind non-deform motor aliases before same-named bones", function()
+			local cameraRig = Instance.new("Model")
+			cameraRig.Name = "CameraAliasRig"
+
+			local rootPart = Instance.new("Part")
+			rootPart.Name = "RootPart"
+			rootPart.Parent = cameraRig
+			cameraRig.PrimaryPart = rootPart
+
+			local cameraPart = Instance.new("MeshPart")
+			cameraPart.Name = "camerapart"
+			cameraPart.Parent = cameraRig
+
+			local cameraMotor = Instance.new("Motor6D")
+			cameraMotor.Name = "cameraMotor6D"
+			cameraMotor.Part0 = rootPart
+			cameraMotor.Part1 = cameraPart
+			cameraMotor.Parent = cameraPart
+
+			local cameraBone = Instance.new("Bone")
+			cameraBone.Name = "camera"
+			cameraBone.Parent = cameraPart
+
+			local rig = rig_module.new(cameraRig)
+			local cameraBoneRigPart = rig:FindRigPart("camera")
+			expect(cameraBoneRigPart.part).to.equal(cameraBone)
+			expect(rig:FindRigPartForAnimation("camera", false).part).to.equal(cameraPart)
+			expect(rig:FindRigPartForAnimation("camera", true).part).to.equal(cameraBone)
+
+			rig:LoadAnimation({
+				t = 1,
+				kfs = {
+					{
+						t = 0,
+						kf = {
+							camera = { 0, 3, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1 },
+						},
+					},
+				},
+			})
+
+			expect(rig:FindRigPartByInstance(cameraPart).poses[0]).to.be.ok()
+			expect(rig:FindRigPartByInstance(cameraBone).poses[0]).to.never.be.ok()
+
+			cameraRig:Destroy()
+		end)
+
 		it("should handle a pure deform rig with only Bones", function()
 			local deform_rig = Instance.new("Model")
 			deform_rig.Name = "DeformRig"
@@ -594,6 +641,64 @@ return function()
 
 			local head_rigpart = spine_rigpart.children[1]
 			expect(head_rigpart.part.Name).to.equal("Head")
+
+			deform_rig:Destroy()
+		end)
+
+		it("should follow exported deform bone hierarchy when live parenting differs", function()
+			local deform_rig = Instance.new("Model")
+			deform_rig.Name = "LiveParentDeformRig"
+
+			local root_part = Instance.new("Part")
+			root_part.Name = "RootPart"
+			root_part.Parent = deform_rig
+			deform_rig.PrimaryPart = root_part
+
+			local root_bone = Instance.new("Bone")
+			root_bone.Name = "Root"
+			root_bone.Parent = root_part
+
+			local lower_torso = Instance.new("Bone")
+			lower_torso.Name = "LowerTorso"
+			lower_torso.Parent = root_bone
+
+			local foot = Instance.new("Bone")
+			foot.Name = "Foot.L"
+			foot.Parent = lower_torso
+
+			local rig = rig_module.new(deform_rig)
+			local identity = { 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1 }
+
+			rig:LoadAnimation({
+				t = 1,
+				is_deform_bone_rig = true,
+				bone_hierarchy = {
+					LowerTorso = "Root",
+					["Foot.L"] = "Root", -- Deliberately wrong; live instance parent is LowerTorso.
+				},
+				kfs = {
+					{
+						t = 0,
+						kf = {
+							Root = identity,
+							LowerTorso = identity,
+							["Foot.L"] = { 0, -1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1 },
+						},
+					},
+				},
+			})
+
+			local kfs = rig:ToRobloxAnimation()
+			local keyframes = kfs:GetKeyframes()
+			local root_pose = keyframes[1].RootPart.Root
+			expect(root_pose).to.be.ok()
+
+			local lower_torso_pose = root_pose.LowerTorso
+			expect(lower_torso_pose).to.be.ok()
+
+			local foot_pose = root_pose:FindFirstChild("Foot.L")
+			expect(foot_pose).to.be.ok()
+			expect(lower_torso_pose:FindFirstChild("Foot.L")).to.equal(nil)
 
 			deform_rig:Destroy()
 		end)

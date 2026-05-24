@@ -27,7 +27,6 @@ local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
 local themeProvider = require(StudioComponentsUtil.themeProvider)
 
 local SharedComponents = require(script.Parent.Parent.SharedComponents)
-local PlaybackControls = require(script.Parent.Parent.Components.PlaybackControls)
 local BoneToggles = require(script.Parent.Parent.Components.BoneToggles)
 
 local BlenderSyncTab = {}
@@ -369,7 +368,6 @@ function BlenderSyncTab.create(services: any)
 					Visible = true,
 					TextTransparency = 0,
 				}),
-				PlaybackControls.createPlaybackSection(services, 14) :: any,
 				Label({
 					Text = "Animation Name",
 					LayoutOrder = 15,
