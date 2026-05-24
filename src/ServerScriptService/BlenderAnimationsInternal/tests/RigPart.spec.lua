@@ -8,7 +8,6 @@ return function()
 				bones = {},
 				bonesByInstance = {},
 				_jointCache = jointCache or {},
-				_duplicateBoneWarnings = {},
 				model = nil,
 			}
 		end
@@ -106,6 +105,68 @@ return function()
 				root:Destroy()
 				left:Destroy()
 				right:Destroy()
+			end)
+
+			it("should keep multiple nested motor branches under one parent", function()
+				local hand = Instance.new("Part")
+				hand.Name = "RightHand"
+				local toolHandleA = Instance.new("Part")
+				toolHandleA.Name = "ToolHandleA"
+				local toolHandleB = Instance.new("Part")
+				toolHandleB.Name = "ToolHandleB"
+				local bladeA = Instance.new("Part")
+				bladeA.Name = "BladeA"
+				local bladeB = Instance.new("Part")
+				bladeB.Name = "BladeB"
+
+				local handToToolA = Instance.new("Motor6D")
+				handToToolA.Name = "RightGripA"
+				handToToolA.Part0 = hand
+				handToToolA.Part1 = toolHandleA
+				handToToolA.Parent = hand
+
+				local handToToolB = Instance.new("Motor6D")
+				handToToolB.Name = "RightGripB"
+				handToToolB.Part0 = hand
+				handToToolB.Part1 = toolHandleB
+				handToToolB.Parent = hand
+
+				local toolAToBlade = Instance.new("Motor6D")
+				toolAToBlade.Name = "BladeJointA"
+				toolAToBlade.Part0 = toolHandleA
+				toolAToBlade.Part1 = bladeA
+				toolAToBlade.Parent = toolHandleA
+
+				local toolBToBlade = Instance.new("Motor6D")
+				toolBToBlade.Name = "BladeJointB"
+				toolBToBlade.Part0 = toolHandleB
+				toolBToBlade.Part1 = bladeB
+				toolBToBlade.Parent = toolHandleB
+
+				local jointCache = {
+					[hand] = { handToToolA, handToToolB },
+					[toolHandleA] = { handToToolA, toolAToBlade },
+					[toolHandleB] = { handToToolB, toolBToBlade },
+					[bladeA] = { toolAToBlade },
+					[bladeB] = { toolBToBlade },
+				}
+				local rig = makeRig(jointCache)
+				local rp = RigPart.new(rig, hand, nil, false)
+
+				expect(rp).to.be.ok()
+				expect(snapshotTree(rp)).to.equal(
+					"RightHand:Root"
+						.. "|RightHand->ToolHandleA:Motor6D"
+						.. "|RightHand->ToolHandleA->BladeA:Motor6D"
+						.. "|RightHand->ToolHandleB:Motor6D"
+						.. "|RightHand->ToolHandleB->BladeB:Motor6D"
+				)
+
+				hand:Destroy()
+				toolHandleA:Destroy()
+				toolHandleB:Destroy()
+				bladeA:Destroy()
+				bladeB:Destroy()
 			end)
 
 			it("should silently prune already-visited parts (cycle guard)", function()
@@ -310,6 +371,68 @@ return function()
 
 				parent:Destroy()
 				child:Destroy()
+			end)
+
+			it("should ignore connected parts outside the rig model", function()
+				local model = Instance.new("Model")
+				model.Name = "RigModel"
+
+				local root = Instance.new("Part")
+				root.Name = "Root"
+				root.Parent = model
+
+				local left = Instance.new("Part")
+				left.Name = "Left"
+				left.Parent = model
+
+				local right = Instance.new("Part")
+				right.Name = "Right"
+				right.Parent = model
+
+				local outside = Instance.new("Part")
+				outside.Name = "Outside"
+				outside.Parent = workspace
+
+				local leftMotor = Instance.new("Motor6D")
+				leftMotor.Name = "LeftMotor"
+				leftMotor.Part0 = root
+				leftMotor.Part1 = left
+				leftMotor.Parent = root
+
+				local rightMotor = Instance.new("Motor6D")
+				rightMotor.Name = "RightMotor"
+				rightMotor.Part0 = root
+				rightMotor.Part1 = right
+				rightMotor.Parent = root
+
+				local leftWeld = Instance.new("Weld")
+				leftWeld.Name = "LeftOutside"
+				leftWeld.Part0 = left
+				leftWeld.Part1 = outside
+				leftWeld.Parent = left
+
+				local rightWeld = Instance.new("Weld")
+				rightWeld.Name = "RightOutside"
+				rightWeld.Part0 = right
+				rightWeld.Part1 = outside
+				rightWeld.Parent = right
+
+				local jointCache = {
+					[root] = { leftMotor, rightMotor },
+					[left] = { leftMotor, leftWeld },
+					[right] = { rightMotor, rightWeld },
+					[outside] = { leftWeld, rightWeld },
+				}
+				local rig = makeRig(jointCache)
+				rig.model = model
+
+				local rp = RigPart.new(rig, root, nil, false)
+
+				expect(rp).to.be.ok()
+				expect(snapshotTree(rp)).to.equal("Root:Root|Root->Left:Motor6D|Root->Right:Motor6D")
+
+				model:Destroy()
+				outside:Destroy()
 			end)
 
 			it("should register parts in rig.bones by name", function()

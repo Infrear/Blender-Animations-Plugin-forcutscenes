@@ -55,11 +55,93 @@ type self = {
 	faceControls: FaceControls,
 	bones: { [string]: RigPart.RigPart },
 	bonesByInstance: { [Instance]: RigPart.RigPart },
+	motorNameAliases: { [string]: RigPart.RigPart },
 	isDeformRig: boolean,
 	boneHierarchy: { [string]: string? },
 	_jointCache: { [Instance]: { CacheableJoint } },
-	_duplicateBoneWarnings: { [string]: boolean }?,
+	_ambiguousAnimationChannels: { [string]: boolean }?,
 }
+
+local function getAnimationChannelPriority(rigPart: any): number
+	if not rigPart then
+		return 0
+	end
+
+	if rigPart.bone then
+		return 3
+	end
+
+	local joint = rigPart.joint
+	if joint then
+		if joint:IsA("Motor6D") or joint:IsA("AnimationConstraint") then
+			return 2
+		end
+		if joint:IsA("Weld") or joint:IsA("WeldConstraint") then
+			return 1
+		end
+	end
+
+	return 0
+end
+
+local function markAmbiguousAnimationChannel(self: any, channelName: string?)
+	if not channelName or channelName == "" then
+		return
+	end
+
+	self._ambiguousAnimationChannels = self._ambiguousAnimationChannels or {}
+	self._ambiguousAnimationChannels[channelName] = true
+end
+
+local function addMotorNameAlias(self: any, aliasMap: { [string]: any }, aliasName: string?, rigPart: any)
+	if not aliasName or aliasName == "" then
+		return
+	end
+
+	local existingAlias = aliasMap[aliasName]
+	if existingAlias and existingAlias ~= rigPart then
+		if getAnimationChannelPriority(existingAlias) >= 2 and getAnimationChannelPriority(rigPart) >= 2 then
+			markAmbiguousAnimationChannel(self, aliasName)
+		end
+		return
+	end
+
+	aliasMap[aliasName] = rigPart
+end
+
+local function registerMotorNameAliases(self: any)
+	self.motorNameAliases = {}
+	if not self.root then
+		return
+	end
+
+	local stack = { self.root }
+	local visited: { [any]: boolean } = {}
+	while #stack > 0 do
+		local rigPart = stack[#stack]
+		stack[#stack] = nil
+
+		if visited[rigPart] then
+			continue
+		end
+		visited[rigPart] = true
+
+		local joint = rigPart.joint
+		if joint and joint:IsA("Motor6D") then
+			local jointName = joint.Name
+			addMotorNameAlias(self, self.motorNameAliases, jointName, rigPart)
+			if string.sub(jointName, -7) == "Motor6D" then
+				addMotorNameAlias(self, self.motorNameAliases, string.sub(jointName, 1, #jointName - 7), rigPart)
+			elseif string.sub(jointName, -5) == "Motor" then
+				addMotorNameAlias(self, self.motorNameAliases, string.sub(jointName, 1, #jointName - 5), rigPart)
+			end
+		end
+
+		for _, child in ipairs(rigPart.children) do
+			stack[#stack + 1] = child
+		end
+	end
+end
 
 function Rig.new(model: Model)
 	local self: self = {
@@ -72,10 +154,11 @@ function Rig.new(model: Model)
 		faceControls = {},
 		bones = {}, -- Initialize bones property
 		bonesByInstance = {},
+		motorNameAliases = {},
 		isDeformRig = false, -- Flag to indicate if this is a deform bone rig
 		boneHierarchy = {}, -- Store bone parent relationships
 		_jointCache = {},
-		_duplicateBoneWarnings = {},
+		_ambiguousAnimationChannels = {},
 	}
 	setmetatable(self, Rig)
 
@@ -92,33 +175,28 @@ function Rig.new(model: Model)
 
 	self.isDeformRig = #allBones > 0
 
-	-- Reject rigs where a Bone and BasePart share the same name. The rig map
-	-- indexes by name, so collisions are ambiguous and can crash downstream logic.
-	do
-		local partNames: { [string]: boolean } = {}
-		local collisionNames: { [string]: boolean } = {}
-		local collisions: { string } = {}
+	-- Check for duplicate bones - this is a problem as animation channels are keyed by name
+	local boneNameCounts: { [string]: number } = {}
+	local duplicateBoneNames: { string } = {}
 
-		for _, descendant in ipairs(model:GetDescendants()) do
-			if descendant:IsA("BasePart") then
-				partNames[descendant.Name] = true
-			end
-		end
-		for _, bone in ipairs(allBones) do
-			if partNames[bone.Name] and not collisionNames[bone.Name] then
-				collisionNames[bone.Name] = true
-				table.insert(collisions, bone.Name)
-			end
-		end
+	for _, bone in ipairs(allBones) do
+		local boneName = bone.Name
+		boneNameCounts[boneName] = (boneNameCounts[boneName] or 0) + 1
+	end
 
-		if #collisions > 0 then
-			table.sort(collisions)
-			error(
-				"PART/BONE NAME COLLISION DETECTED: "
-					.. table.concat(collisions, ", ")
-					.. ". Rename duplicates so BasePart and Bone names are unique."
-			)
+	for boneName, count in pairs(boneNameCounts) do
+		if count > 1 then
+			table.insert(duplicateBoneNames, boneName)
 		end
+	end
+
+	if #duplicateBoneNames > 0 then
+		table.sort(duplicateBoneNames)
+		error(
+			"DUPLICATE BONE NAMES DETECTED: "
+				.. table.concat(duplicateBoneNames, ", ")
+				.. ". Animation channels are keyed by name, so rename duplicates and retry."
+		)
 	end
 
 	-- Pre-build the joint cache for fast lookups based on actual connected parts.
@@ -156,6 +234,8 @@ function Rig.new(model: Model)
 	if self.isDeformRig then
 		self:buildBoneHierarchy(allBones)
 	end
+
+	registerMotorNameAliases(self)
 
 	return self
 end
@@ -329,6 +409,51 @@ function Rig:buildBoneHierarchy(allBones)
     -- intentionally unused local kept for readability when editing
     local _bones = self.bones
 
+	local function findParentRigPartViaJoints(bone: Bone): RigPart?
+		-- Find the part this bone is attached to (bone.Parent should be a BasePart)
+		local boneParentPart = bone.Parent
+		if not boneParentPart or not boneParentPart:IsA("BasePart") then
+			return nil
+		end
+
+		-- Look for Motor6D or AnimationConstraint connecting this part to another
+		local joints = self._jointCache[boneParentPart]
+		if not joints then
+			return nil
+		end
+
+		for _, joint in ipairs(joints) do
+			local part0, part1 = nil, nil
+			if joint:IsA("Motor6D") then
+				part0 = joint.Part0
+				part1 = joint.Part1
+			elseif joint:IsA("AnimationConstraint") then
+				local att0 = joint.Attachment0
+				local att1 = joint.Attachment1
+				part0 = att0 and att0.Parent
+				part1 = att1 and att1.Parent
+			end
+
+			-- Find the other part in the joint
+			local otherPart = nil
+			if part0 == boneParentPart and part1 then
+				otherPart = part1
+			elseif part1 == boneParentPart and part0 then
+				otherPart = part0
+			end
+
+			if otherPart and otherPart:IsA("BasePart") then
+				-- Find the RigPart for the other part
+				local parentRigPart = self.bonesByInstance and self.bonesByInstance[otherPart]
+				if parentRigPart then
+					return parentRigPart
+				end
+			end
+		end
+
+		return nil
+	end
+
 	local unresolved = {}
 	for _, bone in ipairs(allBones) do
 		unresolved[#unresolved + 1] = bone
@@ -341,8 +466,35 @@ function Rig:buildBoneHierarchy(allBones)
 			local bone = unresolved[i]
 			local parentInstance = bone.Parent
 			local parentPart = nil
+
+			-- First try: find parent via bone.Parent (Roblox hierarchy)
 			if parentInstance then
 				parentPart = self:FindRigPartByInstance(parentInstance)
+			end
+
+			-- Second try: find parent via Motor6D/AnimationConstraint connections
+			if not parentPart then
+				parentPart = findParentRigPartViaJoints(bone)
+			end
+
+			-- Third try: if no parent found, try to find via root's children chain
+			if not parentPart and self.root then
+				local function findInHierarchy(rigPart: RigPart, targetName: string): RigPart?
+					if rigPart.part.Name == targetName then
+						return rigPart
+					end
+					for _, child in ipairs(rigPart.children) do
+						local found = findInHierarchy(child, targetName)
+						if found then
+							return found
+						end
+					end
+					return nil
+				end
+
+				if parentInstance and parentInstance:IsA("Instance") then
+					parentPart = findInHierarchy(self.root, parentInstance.Name)
+				end
 			end
 
 			if parentPart then
@@ -411,10 +563,14 @@ function Rig:FindRigPartByInstance(instance: Instance)
 end
 
 function Rig:ClearPoses()
+	if self.root then
+		self.root.poses = {}
+	end
 	for _, rigPart in pairs(self:GetRigParts()) do
 		rigPart.poses = {}
 	end
 	self.faceControls = {}
+	self.keyframeNames = {}
 end
 
 local function decodeFaceControlState(faceData: any): (number, string, string)
@@ -554,7 +710,6 @@ function Rig:LoadAnimation(data, progressCallback: LoadProgressCallback?)
 
 	self:ClearPoses()
 	
-	local isDeformRig = self.isDeformRig
 	local appliedPoseCount = 0
 
 	local exportInfo = data.export_info
@@ -593,15 +748,15 @@ function Rig:LoadAnimation(data, progressCallback: LoadProgressCallback?)
 	end
 
 	-- Accept both canonical and legacy deform flags.
-	if data.is_deform_rig or data.is_deform_bone_rig then
+	local dataIsDeformRig = data.is_deform_rig or data.is_deform_bone_rig
+	if dataIsDeformRig then
 		self.isDeformRig = true
-		isDeformRig = true
 
-		-- If we have bone hierarchy data, update our hierarchy
+		-- If we have bone hierarchy data, update our hierarchy.
 		if data.bone_hierarchy then
 			self.boneHierarchy = data.bone_hierarchy
 
-			-- Ensure our RigPart hierarchy matches the bone hierarchy
+			-- Ensure our RigPart hierarchy matches the exported bone hierarchy.
 			for boneName, parentName in pairs(data.bone_hierarchy) do
 				local bonePart = self:FindRigPart(boneName)
 				if bonePart then
@@ -642,6 +797,7 @@ function Rig:LoadAnimation(data, progressCallback: LoadProgressCallback?)
 
 		local poseTable = if type(kfdef.kf) == "table" then kfdef.kf else {}
 		local faceTable = if type((kfdef :: any).fc) == "table" then (kfdef :: any).fc else nil
+
 		if next(poseTable) == nil and faceTable == nil then
 			warn("Skipping keyframe with invalid pose data at time " .. kfTime)
 			continue
@@ -658,7 +814,15 @@ function Rig:LoadAnimation(data, progressCallback: LoadProgressCallback?)
 
 			processedPoseCount += 1
 
+			local poseMarksDeform = kfdef.kf[partName .. "_deform"] ~= nil
 			local rigPart = self:FindRigPart(partName)
+			if self._ambiguousAnimationChannels and self._ambiguousAnimationChannels[partName] then
+				error(
+					"AMBIGUOUS ANIMATION CHANNELS DETECTED: "
+						.. partName
+						.. ". Duplicate animated rig part names or conflicting Motor6D aliases are unsupported because animation channels are keyed by name."
+				)
+			end
 			if rigPart and poseData then
 				local cfc
 				local easingStyle = "Linear" -- Default
@@ -704,7 +868,7 @@ function Rig:LoadAnimation(data, progressCallback: LoadProgressCallback?)
 
 				-- Check if this is a deform bone marker
 				local isDeformBone = false
-				if kfdef.kf[partName .. "_deform"] or (isDeformRig and rigPart.part:IsA("Bone")) then
+				if poseMarksDeform or (dataIsDeformRig and rigPart.part:IsA("Bone")) then
 					isDeformBone = true
 					rigPart.isDeformBone = true
 				end

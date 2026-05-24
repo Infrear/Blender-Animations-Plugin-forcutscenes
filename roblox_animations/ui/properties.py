@@ -27,6 +27,36 @@ _FACE_CONTROL_DEPSGRAPH_SEQUENCE = 0
 _FACE_CONTROL_DEPSGRAPH_APPLYING = False
 
 
+def _scene_unit_scale(context):
+    scene = getattr(context, "scene", None)
+    unit_settings = getattr(scene, "unit_settings", None)
+    scale_length = getattr(unit_settings, "scale_length", 1.0)
+    try:
+        scale_length = float(scale_length)
+    except (TypeError, ValueError):
+        return 1.0
+    return abs(scale_length) if abs(scale_length) > 1e-6 else 1.0
+
+
+def _on_auto_deform_scale_update(self, context):
+    if getattr(self, "rbx_auto_deform_scale", True):
+        return
+    self.rbx_deform_rig_scale = _scene_unit_scale(context)
+
+
+def _face_controls_playback_active() -> bool:
+    try:
+        screen = getattr(bpy.context, "screen", None)
+    except Exception:
+        screen = None
+    if screen is None:
+        return False
+    try:
+        return bool(getattr(screen, "is_animation_playing", False))
+    except Exception:
+        return False
+
+
 def _on_gravity_update(self, context):
     """Callback when gravity is changed - re-analyze physics if enabled."""
     try:
@@ -115,6 +145,8 @@ def _depsgraph_face_controls_handler(scene, depsgraph):
 
     if _FACE_CONTROL_DEPSGRAPH_APPLYING:
         return
+    if _face_controls_playback_active():
+        return
 
     active_armatures = list(iter_active_facs_armatures())
     if not active_armatures:
@@ -164,11 +196,22 @@ class RobloxAnimationSettings(PropertyGroup):
         max=65535,
     )
 
-    rbx_deform_rig_scale: FloatProperty(
-        name="Deform Rig Scale",
+    rbx_auto_deform_scale: BoolProperty(
+        name="Auto Deform Scale",
         description=(
-            "Enter the scale you exported your rig at for proper animation export. "
-            "Usually 0.1 or 0.2. You can also adjust in Roblox Studio."
+            "Export skinned/deform animation translations in evaluated scene units, "
+            "similar to FBX export."
+        ),
+        default=True,
+        update=_on_auto_deform_scale_update,
+    )
+
+    rbx_deform_rig_scale: FloatProperty(
+        name="Manual Deform Unit Scale",
+        description=(
+            "Manual divisor for skinned/deform animation translations when auto scale "
+            "is disabled. Defaults to the current scene unit scale when auto scale is "
+            "turned off, without changing the scene unit settings."
         ),
         default=0.1,
         min=0.0,
@@ -184,8 +227,11 @@ class RobloxAnimationSettings(PropertyGroup):
     )
 
     rbx_max_studs_per_frame: FloatProperty(
-        name="Max studs/frame",
-        description="maximum allowed displacement per frame (studs)",
+        name="Max studs/frame @30fps",
+        description=(
+            "maximum allowed displacement benchmarked at 30 fps; the validator "
+            "scales this per frame to match the current scene fps"
+        ),
         default=1.0,
         min=0.0,
     )

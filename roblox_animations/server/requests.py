@@ -17,7 +17,11 @@ from ..core.utils import (
     iter_scene_objects,
 )
 from ..core import utils
-from ..animation.serialization import serialize, is_deform_bone_rig
+from ..animation.serialization import (
+    serialize,
+    is_deform_bone_rig,
+    sync_scene_frame_range_to_export_source,
+)
 from ..animation.import_export import import_animation_preserve_ik
 
 
@@ -28,6 +32,18 @@ pending_responses = {}
 transform_to_blender = bpy_extras.io_utils.axis_conversion(
     from_forward="Z", from_up="Y", to_forward="-Y", to_up="Z"
 ).to_4x4()  # transformation matrix from Y-up to Z-up
+
+
+def _get_timeline_scene_for_armature(context_scene, armature):
+    users_scenes = list(getattr(armature, "users_scene", []) or [])
+    if not users_scenes:
+        return context_scene
+    named_scene = bpy.data.scenes.get("Scene")
+    if named_scene and named_scene in users_scenes:
+        return named_scene
+    if context_scene in users_scenes:
+        return context_scene
+    return users_scenes[0]
 
 
 def _get_reported_bone_parent_name(bone):
@@ -61,11 +77,15 @@ def process_pending_requests():
             request_type = request[0]
 
             if request_type == "export_animation":
-                _, task_id, armature_name = request
+                if len(request) >= 4:
+                    _, task_id, armature_name, target_bone_rest = request
+                else:
+                    _, task_id, armature_name = request
+                    target_bone_rest = None
                 print(
                     f"Blender Addon: Dispatching export_animation task (task_id={task_id}, armature={armature_name})"
                 )
-                execute_in_main_thread(task_id, armature_name)
+                execute_in_main_thread(task_id, armature_name, target_bone_rest)
             elif request_type == "list_armatures":
                 _, task_id = request
                 print(
@@ -167,7 +187,7 @@ def execute_list_armatures(task_id):
         )
 
 
-def execute_in_main_thread(task_id, armature_name):
+def execute_in_main_thread(task_id, armature_name, target_bone_rest=None):
     """Execute the animation export in the main thread"""
     try:
         if not armature_name:
@@ -208,7 +228,77 @@ def execute_in_main_thread(task_id, armature_name):
         )
         print(f"Blender Addon: Starting animation export for '{armature_name}'...")
 
-        serialized = serialize(ao)
+        context_scene = bpy.context.scene
+
+        # --- Pre-export validations ---
+        if context_scene.frame_start > context_scene.frame_end:
+            pending_responses[task_id] = (
+                False,
+                f"Invalid frame range: start ({int(context_scene.frame_start)}) > end ({int(context_scene.frame_end)}).",
+            )
+            return
+
+        frame_step = int(getattr(context_scene, "frame_step", 1) or 1)
+        if frame_step < 1:
+            pending_responses[task_id] = (
+                False,
+                f"Invalid frame step: {frame_step}. Must be >= 1.",
+            )
+            return
+
+        animation_data = getattr(ao, "animation_data", None)
+        has_action = animation_data is not None and animation_data.action is not None
+        has_nla = animation_data is not None and animation_data.use_nla
+        if has_nla:
+            # Check if any NLA tracks have unmuted strips
+            has_nla = any(
+                not track.mute and any(True for _ in track.strips)
+                for track in animation_data.nla_tracks
+            )
+        if not has_action and not has_nla:
+            pending_responses[task_id] = (
+                False,
+                f"No animation data found on '{armature_name}'. Please add keyframes or NLA strips.",
+            )
+            return
+        # --- End pre-export validations ---
+
+        timeline_scene = _get_timeline_scene_for_armature(context_scene, ao)
+        original_frame_start = int(context_scene.frame_start)
+        original_frame_end = int(context_scene.frame_end)
+        original_frame_step = int(getattr(context_scene, "frame_step", 1) or 1)
+        changed_scene_timeline = timeline_scene is not context_scene
+
+        if changed_scene_timeline:
+            context_scene.frame_start = int(
+                getattr(timeline_scene, "frame_start", original_frame_start)
+            )
+            context_scene.frame_end = int(
+                getattr(timeline_scene, "frame_end", original_frame_end)
+            )
+            context_scene.frame_step = int(
+                getattr(timeline_scene, "frame_step", original_frame_step) or 1
+            )
+
+        # Sync the scene frame range to the actual animation data so the
+        # exported duration matches the current animation (not a leftover range
+        # from a previously imported/ longer animation).
+        synced_range = sync_scene_frame_range_to_export_source(context_scene, ao)
+
+        serialized = None
+        try:
+            serialized = serialize(ao, target_bone_rest=target_bone_rest)
+        finally:
+            if changed_scene_timeline:
+                context_scene.frame_start = original_frame_start
+                context_scene.frame_end = original_frame_end
+                context_scene.frame_step = original_frame_step
+            elif synced_range is not None:
+                # Restore the original frame range if we synced it
+                context_scene.frame_start = original_frame_start
+                context_scene.frame_end = original_frame_end
+                context_scene.frame_step = original_frame_step
+
         if not serialized:
             pending_responses[task_id] = (
                 False,
@@ -358,6 +448,15 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
                     if not pose_data:
                         continue
 
+                    if bone_name not in all_bone_data:
+                        all_bone_data[bone_name] = {
+                            start_frame: {
+                                "location": pose_bone.location.copy(),
+                                "rotation_quaternion": pose_bone.rotation_quaternion.copy(),
+                                "scale": pose_bone.scale.copy(),
+                            }
+                        }
+
                     # Backwards compatibility: Handle old list-based format and new dict-based format.
                     easing_style = "Linear"  # Default easing
                     easing_direction = "In"  # Default easing
@@ -383,17 +482,24 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
 
                     # --- Matrix Calculation ---
                     # Check if this bone has Motor6D properties (from rig build)
-                    has_motor6d_props = (
+                    is_deform_bone = is_deform_rig and bool(
+                        pose_bone.bone.get("rbx_is_deform_bone", False)
+                        or pose_bone.bone.use_deform
+                    )
+                    has_motor6d_props = (not is_deform_bone) and (
                         "nicetransform" in pose_bone.bone
                         and "transform" in pose_bone.bone
                         and "transform1" in pose_bone.bone
                     )
 
                     if not has_motor6d_props:
-                        # Simple delta path - works for deform bones and any bone without Motor6D data
-                        # The transform is a LOCAL delta in the bone's own space.
-                        # Just apply it directly to the rest pose.
-                        final_matrix = pose_bone.bone.matrix_local @ bone_transform
+                        # Deform animation data is a local pose delta. Apply it to
+                        # matrix_basis so Blender composes it through the parent chain;
+                        # assigning matrix_local @ delta would treat child deltas as
+                        # armature-space targets and rotate them into the wrong axes.
+                        pose_bone.matrix_basis = (
+                            transform_to_blender @ bone_transform @ transform_to_blender.inverted()
+                        )
                     else:  # Motor6D rig
                         back_trans = transform_to_blender.inverted()
                         extr_transform = Matrix(pose_bone.bone["nicetransform"]).inverted()
@@ -435,8 +541,8 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
                             @ extr_transform.inverted()
                         )
 
-                    # --- Apply and Store ---
-                    pose_bone.matrix = final_matrix
+                        # --- Apply Motor6D armature-space target ---
+                        pose_bone.matrix = final_matrix
 
                     if bone_name in all_bone_data:
                         all_bone_data[bone_name][frame] = {
@@ -698,7 +804,8 @@ def execute_get_bone_rest(task_id, armature_name):
         sorted_bones = sorted(ao.pose.bones, key=lambda b: len(b.parent_recursive))
 
         for pose_bone in sorted_bones:
-            has_motor6d_props = (
+            is_imported_deform_bone = bool(pose_bone.bone.get("rbx_is_deform_bone", False))
+            has_motor6d_props = (not is_imported_deform_bone) and (
                 "transform" in pose_bone.bone
                 and "transform1" in pose_bone.bone
                 and "nicetransform" in pose_bone.bone

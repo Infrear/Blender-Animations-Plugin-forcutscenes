@@ -9,7 +9,10 @@ import bpy
 from bpy.types import Operator
 from bpy_extras.io_utils import ExportHelper
 from bpy.props import StringProperty
-from ..animation.serialization import serialize, is_deform_bone_rig
+from ..animation.serialization import (
+    serialize,
+    is_deform_bone_rig,
+)
 from ..animation.import_export import (
     get_mapping_error_bones,
     prepare_for_kf_map,
@@ -17,6 +20,45 @@ from ..animation.import_export import (
     apply_ao_transform,
 )
 from ..core.utils import get_scene_fps, set_scene_fps, get_object_by_name, object_exists
+
+
+def _get_timeline_scene_for_armature(context_scene, armature):
+    users_scenes = list(getattr(armature, "users_scene", []) or [])
+    if not users_scenes:
+        return context_scene
+    named_scene = bpy.data.scenes.get("Scene")
+    if named_scene and named_scene in users_scenes:
+        return named_scene
+    if context_scene in users_scenes:
+        return context_scene
+    return users_scenes[0]
+
+
+def _serialize_with_armature_timeline(context_scene, armature):
+    timeline_scene = _get_timeline_scene_for_armature(context_scene, armature)
+    original_frame_start = int(context_scene.frame_start)
+    original_frame_end = int(context_scene.frame_end)
+    original_frame_step = int(getattr(context_scene, "frame_step", 1) or 1)
+    changed_scene_timeline = timeline_scene is not context_scene
+
+    if changed_scene_timeline:
+        context_scene.frame_start = int(
+            getattr(timeline_scene, "frame_start", original_frame_start)
+        )
+        context_scene.frame_end = int(
+            getattr(timeline_scene, "frame_end", original_frame_end)
+        )
+        context_scene.frame_step = int(
+            getattr(timeline_scene, "frame_step", original_frame_step) or 1
+        )
+
+    try:
+        return serialize(armature)
+    finally:
+        if changed_scene_timeline:
+            context_scene.frame_start = original_frame_start
+            context_scene.frame_end = original_frame_end
+            context_scene.frame_step = original_frame_step
 
 
 class OBJECT_OT_ApplyTransform(bpy.types.Operator):
@@ -118,7 +160,7 @@ class OBJECT_OT_Bake(bpy.types.Operator):
             force_deform = getattr(settings, "force_deform_bone_serialization", False)
             use_deform_bone_serialization = is_deform_bone_rig(ao) or force_deform
 
-            serialized = serialize(ao)
+            serialized = _serialize_with_armature_timeline(context.scene, ao)
             if not serialized:
                 self.report({"ERROR"}, "Failed to serialize animation")
                 return {"CANCELLED"}
@@ -194,7 +236,7 @@ class OBJECT_OT_Bake_File(Operator, ExportHelper):
             force_deform = getattr(settings, "force_deform_bone_serialization", False)
             use_deform_bone_serialization = is_deform_bone_rig(armature) or force_deform
 
-            serialized = serialize(armature)
+            serialized = _serialize_with_armature_timeline(context.scene, armature)
             if not serialized:
                 self.report({"ERROR"}, "Failed to serialize animation")
                 return {"CANCELLED"}

@@ -320,7 +320,6 @@ function RiggingTab.create(services: any)
 	end)
 
 	return {
-		SharedComponents.createHeaderUI(),
 		VerticalCollapsibleSection({
 			Text = "Export Rig",
 			Collapsed = false,

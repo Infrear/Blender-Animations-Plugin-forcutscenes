@@ -218,8 +218,8 @@ function RigPart.new(
 
 	rig.bonesByInstance = rig.bonesByInstance or {}
 	rig.bonesByInstance[part] = self
-	if state then
-		state.visitedAll[part] = true
+	if buildState then
+		buildState.visitedAll[part] = true
 	end
 	
 	-- Debug print to check part type
@@ -271,12 +271,9 @@ function RigPart.new(
 		if preferNew then
 			rig.bones[part.Name] = self
 		else
-			rig._duplicateBoneWarnings = rig._duplicateBoneWarnings or {}
-			if not rig._duplicateBoneWarnings[part.Name] then
-				rig._duplicateBoneWarnings[part.Name] = true
-				if not isAccessoryPart(part) then
-					warn("Duplicate rig part name detected:", part.Name, "for model", rig.model and rig.model.Name or "<unknown>")
-				end
+			if selfPriority == existingPriority and selfPriority >= 2 then
+				rig._ambiguousAnimationChannels = rig._ambiguousAnimationChannels or {}
+				rig._ambiguousAnimationChannels[part.Name] = true
 			end
 		end
 	end
@@ -285,6 +282,18 @@ function RigPart.new(
 	for _, jointInfo in ipairs(getSortedTraversalJoints(part, rig._jointCache[part])) do
 		local subpart = jointInfo.otherPart
 		if subpart and (not parent or subpart ~= parent.part) then
+			-- For hierarchical joints (Motor6D), only traverse parent->child direction
+			local joint = jointInfo.joint
+			if joint and joint:IsA("Motor6D") then
+				if joint.Part0 ~= part then
+					-- This direction is Part1 -> Part0 (reverse), skip
+					continue
+				end
+			end
+			
+			if rig.model and not subpart:IsDescendantOf(rig.model) then
+				continue
+			end
 			local child = RigPart.new(rig, subpart, self, isDeformRig, jointInfo.joint, state)
 			if child then
 				table.insert(self.children, child)
@@ -387,6 +396,7 @@ function RigPart:PoseToRobloxAnimation(t)
 	local pose = Instance.new("Pose")
 	pose.Name = part.Name
 	pose.Weight = enabled and 1 or 0
+	pose.EasingStyle = Enum.PoseEasingStyle.Linear
 
 	if poseToApply then
 		local transform = poseToApply.transform

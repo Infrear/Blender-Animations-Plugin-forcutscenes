@@ -600,6 +600,7 @@ def set_scene_fps(desired_fps):
 
 
 def get_scene_fps():
-    """Get the current scene FPS"""
+    """Get the current scene FPS, with a safe minimum to prevent division by zero."""
     scene = bpy.context.scene
-    return scene.render.fps / scene.render.fps_base
+    fps = scene.render.fps / scene.render.fps_base
+    return max(fps, 1.0)

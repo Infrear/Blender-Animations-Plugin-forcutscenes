@@ -9,6 +9,7 @@ from .server import (
     stop_server,
     is_server_running,
     get_server_status,
+    handle_blend_file_loaded,
 )
 from .handler import (
     AnimationHandler,
@@ -22,7 +23,7 @@ from .requests import (
 
 def load_handler(dummy):
     """Handler for addon loading"""
-    pass
+    handle_blend_file_loaded(dummy)
 
 
 __all__ = [
@@ -31,6 +32,7 @@ __all__ = [
     "stop_server",
     "is_server_running",
     "get_server_status",
+    "handle_blend_file_loaded",
     # Handler
     "AnimationHandler",
     # Requests

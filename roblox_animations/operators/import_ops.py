@@ -641,14 +641,22 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
         def collect_expected_positions(node, depth=0):
             if not node:
                 return
-            jname = node.get("jname") or node.get("pname") or ""
+            jname = node.get("jname")
+            pname = node.get("pname")
             node_transform = node.get("transform")
-            if jname and node_transform:
-                try:
-                    expected_loc = (t2b @ cf_to_mat(node_transform)).to_translation()
-                    expected_loc_by_name[jname.lower()].append(expected_loc)
-                except Exception:
-                    pass
+            if node_transform:
+                if jname:
+                    try:
+                        expected_loc = (t2b @ cf_to_mat(node_transform)).to_translation()
+                        expected_loc_by_name[jname.lower()].append(expected_loc)
+                    except Exception:
+                        pass
+                if pname and pname != jname:
+                    try:
+                        expected_loc = (t2b @ cf_to_mat(node_transform)).to_translation()
+                        expected_loc_by_name[pname.lower()].append(expected_loc)
+                    except Exception:
+                        pass
 
             aux_names = node.get("aux") or []
             aux_transforms = node.get("auxTransform") or []
@@ -737,19 +745,20 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
         }
         all_candidates.append(cand)
     
-    # Scoring parameters
+    # Scoring parameters — tightened to reduce false positives
     SIZE_WEIGHT = 1.0
     RATIO_WEIGHT = 4.0       # aspect ratios are scale-invariant, very reliable
     POS_WEIGHT = 5.0          # position is the most trustworthy signal
-    SIDE_MISMATCH_PENALTY = 50.0  # wrong-side-of-rig penalty
+    SIDE_MISMATCH_PENALTY = 100.0  # wrong-side-of-rig penalty (was 50)
+    # wrap_layer/body family mismatch is now blocked below unless name-confirmed
     
-    MAX_ACCEPTABLE_REL_DIFF = 0.08  # relaxed — size is a soft signal now
+    MAX_ACCEPTABLE_REL_DIFF = 0.06  # tightened (was 0.08)
     MAX_ACCEPTABLE_DIFF_VOL = 0.02
     MIN_SCALE = 0.1
     MAX_SCALE = 10.0
     
     PROHIBITIVE_COST = 1e6   # "impossible" assignment cost
-    MAX_ACCEPTABLE_COST = 3.0  # reject matches above this (good matches are <1.0)
+    MAX_ACCEPTABLE_COST = 2.5  # reject matches above this (was 3.0)
     
     n_targets = len(fp_targets)
     n_cands = len(all_candidates)
@@ -780,8 +789,8 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
     else:
         estimated_rig_scale = 1.0
     
-    # position distance threshold scales with rig scale
-    MAX_POS_DIST = max(0.5, 0.5 * estimated_rig_scale)
+    # position distance threshold scales with rig scale but capped
+    MAX_POS_DIST = min(max(0.5, 0.5 * estimated_rig_scale), 3.0)
     
     print(f"[RigImport] Pre-estimated rig scale: {estimated_rig_scale:.4f}, pos threshold: {MAX_POS_DIST:.3f}")
     
@@ -804,9 +813,18 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
             obj = cand["obj"]
             mesh_center = mesh_centers[obj]
             name_confirmed_wrap = is_wrap_layer and cand.get("resolved_name") == target_lower
+            family_penalty = 0.0
 
             if cand.get("family") != target_family:
-                continue
+                if is_wrap_layer and name_confirmed_wrap:
+                    # name-confirmed wrap_layer (e.g. Handle->Pants) gets no penalty
+                    family_penalty = 0.0
+                elif is_wrap_layer:
+                    # allow wrap_layer targets to reclaim body-named candidates
+                    family_penalty = 0.25
+                else:
+                    # block family cross-over for non-wrap targets
+                    continue
             
             # --- size compatibility check ---
             if is_vol:
@@ -880,7 +898,8 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
             score = (SIZE_WEIGHT * size_norm
                      + RATIO_WEIGHT * ratio_norm
                      + POS_WEIGHT * pos_norm
-                     + side_penalty)
+                     + side_penalty
+                     + family_penalty)
             
             cost_matrix[ti, ci] = score
             scale_matrix[ti, ci] = scale
@@ -1187,6 +1206,7 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
     # distant or wrong-sized bones.
     expected_dims_by_name = {}  # target_name_lower -> sorted dims tuple
     synth_preferred_targets = set()
+    wrap_layer_target_names = set()
     if meta_loaded:
         part_aux_raw = meta_loaded.get("partAux")
         if part_aux_raw:
@@ -1207,8 +1227,16 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
                     and item.get("wrap_target")
                 ):
                     synth_preferred_targets.add(name.lower())
+                if name and item.get("wrap_layer"):
+                    wrap_layer_target_names.add(name.lower())
     if expected_dims_by_name:
         print(f"[RigImport] Loaded expected sizes for {len(expected_dims_by_name)} parts")
+
+    wrap_layer_candidate_objs = {
+        obj
+        for obj in mesh_objects
+        if _resolve_imported_obj_name(obj.name, known_target_names) in wrap_layer_target_names
+    }
 
     # Precompute mesh sizes for size gating
     mesh_dims = {}  # obj -> sorted dims tuple
@@ -1238,7 +1266,7 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
         available = [o for o in candidates if o not in used]
         return available[0] if available else None
     
-    def match_by_position(cf, target_name, allow_reserved_override=False, max_distance_override=None):
+    def match_by_position(cf, target_name, allow_reserved_override=False, max_distance_override=None, extra_exclude=None):
         """Match by spatial-hash nearest-neighbor lookup with size-aware tolerance.
         
         Tolerance scales with the expected part size — tiny parts need to be
@@ -1260,18 +1288,19 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
         exclude = set(used) | fp_matched_objs
         if not allow_reserved_override:
             exclude.update(reserved_by_name.get(target_name.lower(), frozenset()))
+        if extra_exclude:
+            exclude.update(extra_exclude)
         
         # Adaptive tolerance: scale by expected part size.
         # A part 2 studs across can be 0.5 units away; a part 0.01 studs across
-        # should be within ~0.05 units.
+        # should be within ~0.05 units. Cap at 2.0 to avoid huge tolerances.
         target_lower = target_name.lower()
         exp_dims = expected_dims_by_name.get(target_lower)
         if exp_dims:
             exp_size = max(exp_dims) * (scale_factor if scale_factor else 1.0)
-            # tolerance = clamp(exp_size * 0.5, 0.05, 0.5) scaled by rig scale
-            pos_tolerance = max(0.05, min(0.5, exp_size * 0.5)) * max(1.0, scale_factor if scale_factor else 1.0)
+            pos_tolerance = min(2.0, max(0.05, min(0.5, exp_size * 0.5)) * max(1.0, scale_factor if scale_factor else 1.0))
         else:
-            pos_tolerance = max(0.5, 0.5 * scale_factor) if scale_factor else 0.5
+            pos_tolerance = min(2.0, max(0.5, 0.5 * scale_factor) if scale_factor else 0.5)
         
         query_max_distance = max_distance_override if max_distance_override is not None else pos_tolerance
         best, dist = spatial.query_nearest(expected_loc, exclude, max_distance=query_max_distance)
@@ -1284,7 +1313,7 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
                     mesh_sig = sum(m_dims)
                     if exp_sig > 1e-6 and mesh_sig > 1e-6:
                         ratio = mesh_sig / exp_sig
-                        if ratio < 0.2 or ratio > 5.0:
+                        if ratio < 0.3 or ratio > 3.0:
                             print(f"[RigImport]   '{target_name}' REJECTED '{best.name}' (size ratio={ratio:.2f}, dist={dist:.4f})")
                             return None
             
@@ -1307,6 +1336,7 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
             target_name,
             allow_reserved_override=False,
             max_distance_override=strong_tolerance,
+            extra_exclude=wrap_layer_candidate_objs,
         )
 
     # Pre-mark fingerprint-matched objects as used so they don't get stolen
@@ -1398,7 +1428,12 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
                 if obj:
                     print(f"[RigImport] {prefix}'{target_name}' matched by STRONG POSITION -> '{obj.name}'")
                 else:
-                    obj = match_by_position(transform, target_name, allow_reserved_override=True)
+                    obj = match_by_position(
+                        transform,
+                        target_name,
+                        allow_reserved_override=True,
+                        extra_exclude=wrap_layer_candidate_objs,
+                    )
                     if obj:
                         print(f"[RigImport] {prefix}'{target_name}' matched by POSITION (wrap target fallback) -> '{obj.name}'")
         else:
@@ -1412,7 +1447,11 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
                 if obj:
                     print(f"[RigImport] {prefix}'{target_name}' matched by STRONG POSITION -> '{obj.name}'")
                 else:
-                    obj = match_by_position(transform, target_name)
+                    obj = match_by_position(
+                        transform,
+                        target_name,
+                        extra_exclude=wrap_layer_candidate_objs,
+                    )
                     if obj:
                         print(f"[RigImport] {prefix}'{target_name}' matched by POSITION (wrap target fallback) -> '{obj.name}'")
 
@@ -2211,7 +2250,7 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
                 meta = json.dumps(meta_loaded, separators=(",", ":"))
 
             print(
-                f"[RigImport] import_ops build=2.4.6 export_version={meta_loaded.get('version', 'unknown')} "
+                f"[RigImport] import_ops build=2.4.7 export_version={meta_loaded.get('version', 'unknown')} "
                 f"has_skinned_mesh_metadata={_meta_has_skinned_meshes(meta_loaded)} "
                 f"has_filemesh_candidates={_meta_has_filemesh_candidates(meta_loaded)}"
             )

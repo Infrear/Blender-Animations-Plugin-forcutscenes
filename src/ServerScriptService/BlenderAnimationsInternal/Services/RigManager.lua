@@ -159,7 +159,7 @@ function RigManager:rebuildBoneWeights()
 	local boneList: Types.BoneWeightsList = {}
 	local exportBoneList: Types.ExportBoneWeightsList = {}
 	local function buildBoneListIterative(root)
-		local stack = { { node = root, depth = 0 } }
+		local stack = { { node = root, depth = 0, parent = nil } }
 		local visited = {}
 		local processed = 0
 		while #stack > 0 do
@@ -180,26 +180,30 @@ function RigManager:rebuildBoneWeights()
 				warn("Bone hierarchy too deep (>", EXTREME_DEPTH_LIMIT, " levels), stopping traversal at:", node.part.Name)
 				continue
 			end
-			for _, child in ipairs(node.children) do
+			if node ~= root then
+				local shouldShow = not hasAnimatedBones or (bonesToShow and bonesToShow[node])
+				if shouldShow then
+					table.insert(boneList, {
+						name = node.part.Name,
+						enabled = node.enabled,
+						depth = depth,
+						parentName = current.parent and current.parent.part.Name or nil,
+					})
+				end
+			end
+			for i = #node.children, 1, -1 do
+				local child = node.children[i]
 				if child.jointType == "Weld" or child.jointType == "WeldConstraint" then
 					-- Skip welds in bone toggles
 					continue
 				end
-				if not hasAnimatedBones or (bonesToShow and bonesToShow[child]) then
-					table.insert(boneList, {
-						name = child.part.Name,
-						enabled = child.enabled,
-						depth = depth,
-						parentName = node.part.Name,
-					})
-				end
-				stack[#stack + 1] = { node = child, depth = depth + 1 }
+				stack[#stack + 1] = { node = child, depth = depth + 1, parent = node }
 			end
 		end
 	end
 
 	local function buildExportBoneListIterative(root)
-		local stack = { { node = root, depth = 0 } }
+		local stack = { { node = root, depth = 0, parent = nil } }
 		local visited = {}
 		local processed = 0
 		while #stack > 0 do
@@ -220,18 +224,20 @@ function RigManager:rebuildBoneWeights()
 				warn("Bone hierarchy too deep (>", EXTREME_DEPTH_LIMIT, " levels), stopping traversal at:", node.part.Name)
 				continue
 			end
-			for _, child in ipairs(node.children) do
+			if node ~= root then
+				table.insert(exportBoneList, {
+					name = node.part.Name,
+					enabled = node.exportEnabled ~= false,
+					depth = depth,
+					parentName = current.parent and current.parent.part.Name or nil,
+				})
+			end
+			for i = #node.children, 1, -1 do
+				local child = node.children[i]
 				if child.jointType == "Weld" or child.jointType == "WeldConstraint" then
-					-- Skip welds in export toggles
 					continue
 				end
-				table.insert(exportBoneList, {
-					name = child.part.Name,
-					enabled = child.exportEnabled ~= false,
-					depth = depth,
-					parentName = node.part.Name,
-				})
-				stack[#stack + 1] = { node = child, depth = depth + 1 }
+				stack[#stack + 1] = { node = child, depth = depth + 1, parent = node }
 			end
 		end
 	end
@@ -503,7 +509,7 @@ function RigManager:syncBones(blenderSyncManager: any?): boolean
 
     -- check if server is connected
     if not State.isServerConnected:get() then
-        print("Sync Bones: Not connected to Blender server. Please connect in the Blender Sync tab first.")
+        print("Sync Bones: Not connected to Blender server. Please connect from the Player tab first.")
         return false
     end
 

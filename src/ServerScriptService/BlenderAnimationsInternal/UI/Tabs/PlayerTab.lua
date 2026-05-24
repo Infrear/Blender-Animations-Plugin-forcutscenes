@@ -16,7 +16,6 @@ local Spring = Fusion.Spring
 local StudioComponents = script.Parent.Parent.Parent.Components:FindFirstChild("StudioComponents")
 local Checkbox = require(StudioComponents.Checkbox)
 local Button = require(StudioComponents.Button)
-local MainButton = require(StudioComponents.MainButton)
 local Label = require(StudioComponents.Label)
 local Dropdown = require(StudioComponents.Dropdown)
 local TextInput = require(StudioComponents.TextInput)
@@ -26,115 +25,19 @@ local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
 local themeProvider = require(StudioComponentsUtil.themeProvider)
 
 local SharedComponents = require(script.Parent.Parent.SharedComponents)
-local PlaybackControls = require(script.Parent.Parent.Components.PlaybackControls)
+local AnimationImportControls = require(script.Parent.Parent.Components.AnimationImportControls)
 local BoneToggles = require(script.Parent.Parent.Components.BoneToggles)
 
 local PlayerTab = {}
 
 function PlayerTab.create(services: any)
-	local importHint = Value("")
 	local saveUploadHint = Value("")
 	local previousAnimCount = Value(0)
 	local newAnimIndices = Value({} :: { [number]: boolean })
 	local rowStateCache: { [any]: { animProgress: any, isHovering: any, isPressed: any } } = {}
 
 	return {
-		SharedComponents.createHeaderUI(),
-		PlaybackControls.createPlaybackSection(services),
-		VerticalCollapsibleSection({
-			Text = "Legacy Import",
-			Collapsed = false,
-			LayoutOrder = 1,
-			Visible = Computed(function()
-				return State.enableFileExport:get() or State.enableClipboardExport:get()
-			end),
-			[Children] = {
-				MainButton({
-					Text = "Import Animation from Clipboard",
-					Size = UDim2.new(1, 0, 0, 30),
-					Enabled = Computed(function()
-						return State.activeRigExists:get() and State.enableClipboardExport:get()
-					end),
-					Activated = function(): nil
-						services.playbackService:stopAnimationAndDisconnect()
-						local importScriptText = "Paste the animation data below this line"
-
-						services.exportManager:clearMetaParts()
-						if State.importScript then
-							State.importScript:Destroy()
-						end
-						local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-						State.importScript = Instance.new("Script", game.Workspace)
-						assert(State.importScript)
-						State.importScript.Archivable = false
-						State.importScript.Source = "-- " .. importScriptText .. "\n"
-						if Plugin then
-							Plugin:OpenScript(State.importScript, 2)
-						end
-						local tempConnection: RBXScriptConnection
-						tempConnection = State.importScript.Changed:Connect(function(prop)
-							if prop == "Source" then
-								tempConnection:Disconnect()
-								if State.importScript then
-									local animData = select(
-										3,
-										string.find(
-											State.importScript.Source,
-											"^%-%- " .. importScriptText .. "\n(.*)$"
-										)
-									)
-									State.importScript:Destroy()
-									State.importScript = nil
-									if animData then
-										services.animationManager:loadAnimDataFromText(animData, false)
-									end
-								end
-							end
-						end)
-						return nil
-					end,
-					[OnEvent("MouseEnter")] = function()
-						importHint:set("Opens a script editor. Paste animation data from the clipboard to import.")
-					end,
-					[OnEvent("MouseLeave")] = function()
-						importHint:set("")
-					end,
-				}) :: any,
-				MainButton({
-					Text = "Import Animation from File(s)",
-					Size = UDim2.new(1, 0, 0, 30),
-					Enabled = Computed(function()
-						return State.activeRigExists:get() and State.enableFileExport:get()
-					end),
-					Activated = function(): nil
-						services.animationManager:importAnimationsBulk()
-						return nil
-					end,
-					[OnEvent("MouseEnter")] = function()
-						importHint:set("Opens a file dialog to import multiple .rbxanim files at once.")
-					end,
-					[OnEvent("MouseLeave")] = function()
-						importHint:set("")
-					end,
-				}) :: any,
-				SharedComponents.AnimatedHintLabel({
-					Text = importHint,
-					LayoutOrder = 3,
-					ClipsDescendants = true,
-					Size = UDim2.new(1, 0, 0, 0),
-					TextWrapped = true,
-					Visible = true,
-					TextTransparency = 0,
-				}),
-				Label({
-					Text = "Using the Blender Sync tab is recommended for additional features, file and clipboard import will continue to be supported but may lack features in the future.",
-					LayoutOrder = 4,
-				}),
-			},
-		}),
-
-		-- Playback section would go here (extracted to separate module)
-
+		AnimationImportControls.create(services, 1),
 		VerticalCollapsibleSection({
 			Text = "Save/Upload",
 			Collapsed = false,

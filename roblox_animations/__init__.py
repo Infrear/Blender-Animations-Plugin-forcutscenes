@@ -26,7 +26,7 @@ bl_info = {
     "name": "Roblox Animations Importer/Exporter",
     "description": "Plugin for importing roblox rigs and exporting animations.",
     "author": "Cautioned",
-    "version": (2, 5, 1),
+    "version": (2, 6, 0),
     "blender": (2, 80, 0),
     "location": "View3D > Toolbar",
 }
@@ -73,10 +73,10 @@ _classes = [
     _resolve_operator_class("OBJECT_OT_ClearCOMWeights"),
     _resolve_operator_class("OBJECT_OT_SetSelectedBoneWeight"),
     # AutoPhysics operators
-    _resolve_operator_class("OBJECT_OT_ToggleAutoPhysics"),
-    _resolve_operator_class("OBJECT_OT_AnalyzePhysics"),
-    _resolve_operator_class("OBJECT_OT_TogglePhysicsGhost"),
-    _resolve_operator_class("OBJECT_OT_ToggleRotationMomentum"),
+    # _resolve_operator_class("OBJECT_OT_ToggleAutoPhysics"),
+    # _resolve_operator_class("OBJECT_OT_AnalyzePhysics"),
+    # _resolve_operator_class("OBJECT_OT_TogglePhysicsGhost"),
+    # _resolve_operator_class("OBJECT_OT_ToggleRotationMomentum"),
     # Weld bone visibility
     _resolve_operator_class("OBJECT_OT_ToggleWeldBones"),
     # World-space unparent
@@ -144,6 +144,23 @@ def _safe_register_class(cls):
             pass
 
 
+@bpy.app.handlers.persistent
+def _on_blend_file_loaded(dummy):
+    server.load_handler(dummy)
+
+
+def _remove_blend_file_load_handlers():
+    for handler in list(bpy.app.handlers.load_post):
+        if (
+            getattr(handler, "__name__", "") == _on_blend_file_loaded.__name__
+            and getattr(handler, "__module__", "") == __name__
+        ):
+            try:
+                bpy.app.handlers.load_post.remove(handler)
+            except ValueError:
+                pass
+
+
 def file_import_extend(self, context):
     """Add import options to the file menu"""
     import_model_op = _resolve_operator_class("OBJECT_OT_ImportModel", fallback_module="import_ops")
@@ -182,6 +199,9 @@ def register():
         # Register request processing timer
         if not bpy.app.timers.is_registered(server.process_pending_requests):
             bpy.app.timers.register(server.process_pending_requests, persistent=True)
+
+        _remove_blend_file_load_handlers()
+        bpy.app.handlers.load_post.append(_on_blend_file_loaded)
 
     except Exception as e:
         print(f"Error registering Roblox Animations addon: {e}")
@@ -242,6 +262,11 @@ def unregister():
         try:
             if bpy.app.timers.is_registered(server.process_pending_requests):
                 bpy.app.timers.unregister(server.process_pending_requests)
+        except Exception:
+            pass
+
+        try:
+            _remove_blend_file_load_handlers()
         except Exception:
             pass
 

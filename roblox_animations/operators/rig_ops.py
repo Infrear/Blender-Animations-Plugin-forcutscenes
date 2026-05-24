@@ -13,6 +13,21 @@ from ..core.utils import (
 )
 
 
+def _resolve_autophysics_armature(context):
+    settings = getattr(getattr(context, "scene", None), "rbx_anim_settings", None)
+    armature_name = getattr(settings, "rbx_anim_armature", "") if settings else ""
+    if armature_name:
+        armature = get_object_by_name(armature_name)
+        if armature and armature.type == "ARMATURE":
+            return armature
+
+    obj = getattr(context, "active_object", None)
+    if obj and obj.type == "ARMATURE":
+        return obj
+
+    return None
+
+
 class OBJECT_OT_GenRig(bpy.types.Operator):
     bl_label = "Generate rig"
     bl_idname = "object.rbxanims_genrig"
@@ -745,112 +760,207 @@ class OBJECT_OT_SetSelectedBoneWeight(bpy.types.Operator):
 # AutoPhysics Operators
 # =============================================================================
 
-class OBJECT_OT_ToggleAutoPhysics(bpy.types.Operator):
-    """Toggle AutoPhysics visualization"""
-    bl_label = "Toggle AutoPhysics"
-    bl_idname = "object.rbxanims_toggle_autophysics"
-    bl_description = "Toggle physics-based animation analysis and ghost preview"
-    bl_options = {'REGISTER'}
+# class OBJECT_OT_ToggleAutoPhysics(bpy.types.Operator):
+#     """Toggle AutoPhysics visualization"""
+#     bl_label = "Toggle AutoPhysics"
+#     bl_idname = "object.rbxanims_toggle_autophysics"
+#     bl_description = "Toggle physics-based animation analysis and ghost preview"
+#     bl_options = {'REGISTER'}
 
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return obj and obj.type == "ARMATURE"
+#     @classmethod
+#     def poll(cls, context):
+#         return _resolve_autophysics_armature(context) is not None
 
-    def execute(self, context):
-        from ..rig.physics import (
-            is_physics_enabled,
-            enable_physics_visualization,
-            analyze_animation,
-            register_physics_frame_handler,
-            unregister_physics_frame_handler,
-        )
+#     def execute(self, context):
+#         from ..rig.physics import (
+#             is_physics_enabled,
+#             enable_physics_visualization,
+#             analyze_animation,
+#             register_physics_frame_handler,
+#             unregister_physics_frame_handler,
+#         )
         
-        obj = context.active_object
+#         obj = _resolve_autophysics_armature(context)
+#         if obj is None:
+#             self.report({"ERROR"}, "No armature selected for AutoPhysics")
+#             return {"CANCELLED"}
         
-        if is_physics_enabled():
-            enable_physics_visualization(False)
-            unregister_physics_frame_handler()
-            self.report({"INFO"}, "AutoPhysics disabled")
-        else:
-            # Analyze the animation first
-            self.report({"INFO"}, "Analyzing animation physics...")
-            analyze_animation(obj)
-            enable_physics_visualization(True)
-            register_physics_frame_handler()
-            self.report({"INFO"}, "AutoPhysics enabled")
+#         if is_physics_enabled():
+#             enable_physics_visualization(False)
+#             unregister_physics_frame_handler()
+#             self.report({"INFO"}, "AutoPhysics disabled")
+#         else:
+#             # Analyze the animation first
+#             self.report({"INFO"}, "Analyzing animation physics...")
+#             analyze_animation(obj)
+#             enable_physics_visualization(True)
+#             register_physics_frame_handler()
+#             self.report({"INFO"}, "AutoPhysics enabled")
         
-        return {"FINISHED"}
+#         return {"FINISHED"}
 
 
-class OBJECT_OT_AnalyzePhysics(bpy.types.Operator):
-    """Re-analyze animation physics"""
-    bl_label = "Analyze Physics"
-    bl_idname = "object.rbxanims_analyze_physics"
-    bl_description = "Re-analyze the animation for physics validity"
-    bl_options = {'REGISTER'}
+# class OBJECT_OT_AnalyzePhysics(bpy.types.Operator):
+#     """Re-analyze animation physics"""
+#     bl_label = "Analyze Physics"
+#     bl_idname = "object.rbxanims_analyze_physics"
+#     bl_description = "Re-analyze the animation for physics validity"
+#     bl_options = {'REGISTER'}
 
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return obj and obj.type == "ARMATURE"
+#     @classmethod
+#     def poll(cls, context):
+#         return _resolve_autophysics_armature(context) is not None
 
-    def execute(self, context):
-        from ..rig.physics import analyze_animation, is_physics_enabled
+#     def execute(self, context):
+#         from ..rig.physics import analyze_animation, is_physics_enabled
         
-        obj = context.active_object
-        analyze_animation(obj)
+#         obj = _resolve_autophysics_armature(context)
+#         if obj is None:
+#             self.report({"ERROR"}, "No armature selected for physics analysis")
+#             return {"CANCELLED"}
+#         analyze_animation(obj)
         
-        if is_physics_enabled():
-            self.report({"INFO"}, "Physics analysis updated")
-        else:
-            self.report({"INFO"}, "Physics analyzed (enable AutoPhysics to visualize)")
+#         if is_physics_enabled():
+#             self.report({"INFO"}, "Physics analysis updated")
+#         else:
+#             self.report({"INFO"}, "Physics analyzed (enable AutoPhysics to visualize)")
         
-        return {"FINISHED"}
+#         return {"FINISHED"}
 
 
-class OBJECT_OT_TogglePhysicsGhost(bpy.types.Operator):
-    """Toggle ghost character display"""
-    bl_label = "Toggle Ghost"
-    bl_idname = "object.rbxanims_toggle_physics_ghost"
-    bl_description = "Toggle the physics ghost character display"
-    bl_options = {'REGISTER'}
+# class OBJECT_OT_TogglePhysicsGhost(bpy.types.Operator):
+#     """Toggle ghost character display"""
+#     bl_label = "Toggle Ghost"
+#     bl_idname = "object.rbxanims_toggle_physics_ghost"
+#     bl_description = "Toggle the physics ghost character display"
+#     bl_options = {'REGISTER'}
 
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return obj and obj.type == "ARMATURE"
+#     @classmethod
+#     def poll(cls, context):
+#         return _resolve_autophysics_armature(context) is not None
 
-    def execute(self, context):
-        from ..rig.physics import toggle_ghost, is_ghost_enabled
+#     def execute(self, context):
+#         from ..rig.physics import toggle_ghost, is_ghost_enabled
         
-        toggle_ghost()
-        state = "enabled" if is_ghost_enabled() else "disabled"
-        self.report({"INFO"}, f"Physics ghost {state}")
+#         toggle_ghost()
+#         state = "enabled" if is_ghost_enabled() else "disabled"
+#         self.report({"INFO"}, f"Physics ghost {state}")
         
-        return {"FINISHED"}
+#         return {"FINISHED"}
 
 
-class OBJECT_OT_ToggleRotationMomentum(bpy.types.Operator):
-    """Toggle rotation-based momentum visualization"""
-    bl_label = "Toggle Rotation Momentum"
-    bl_idname = "object.rbxanims_toggle_rotation_momentum"
-    bl_description = "Toggle the angular momentum / rotation visualization"
-    bl_options = {'REGISTER'}
+# class OBJECT_OT_FocusTrajectory(bpy.types.Operator):
+#     """Jump to the trajectory frame that most needs attention"""
+#     bl_label = "Focus Trajectory"
+#     bl_idname = "object.rbxanims_focus_trajectory"
+#     bl_description = "Jump to the most useful trajectory frame"
+#     bl_options = {'REGISTER'}
 
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return obj and obj.type == "ARMATURE"
+#     @classmethod
+#     def poll(cls, context):
+#         return _resolve_autophysics_armature(context) is not None
 
-    def execute(self, context):
-        from ..rig.physics import toggle_angular_momentum, is_angular_momentum_enabled
+#     def execute(self, context):
+#         from ..rig.physics import (
+#             analyze_animation,
+#             enable_physics_visualization,
+#             get_trajectory_focus_frame,
+#             get_trajectory_summary,
+#             is_physics_enabled,
+#             register_physics_frame_handler,
+#         )
+
+#         obj = _resolve_autophysics_armature(context)
+#         if obj is None:
+#             self.report({"ERROR"}, "No armature selected for trajectory focus")
+#             return {"CANCELLED"}
+
+#         summary = get_trajectory_summary()
+#         if not summary.get("has_analysis"):
+#             analyze_animation(obj)
+
+#         if not is_physics_enabled():
+#             enable_physics_visualization(True)
+#             register_physics_frame_handler()
+
+#         focus_frame = get_trajectory_focus_frame()
+#         if focus_frame is None:
+#             self.report({"INFO"}, "No trajectory frame found")
+#             return {"FINISHED"}
+
+#         context.scene.frame_set(int(focus_frame))
+#         self.report({"INFO"}, f"Focused trajectory frame {focus_frame}")
+#         return {"FINISHED"}
+
+
+# class OBJECT_OT_ApplyTrajectoryIK(bpy.types.Operator):
+#     """Apply trajectory foot targets to existing IK controls"""
+#     bl_label = "Apply Trajectory IK"
+#     bl_idname = "object.rbxanims_apply_trajectory_ik"
+#     bl_description = "Move existing foot IK controls to the trajectory targets"
+#     bl_options = {'REGISTER', 'UNDO'}
+
+#     @classmethod
+#     def poll(cls, context):
+#         return _resolve_autophysics_armature(context) is not None
+
+#     def execute(self, context):
+#         from ..rig.physics import (
+#             analyze_animation,
+#             apply_trajectory_ik_assist,
+#             enable_physics_visualization,
+#             get_trajectory_summary,
+#             is_physics_enabled,
+#             register_physics_frame_handler,
+#         )
+
+#         obj = _resolve_autophysics_armature(context)
+#         if obj is None:
+#             self.report({"ERROR"}, "no armature selected for trajectory ik")
+#             return {"CANCELLED"}
+
+#         summary = get_trajectory_summary()
+#         if not summary.get("has_analysis"):
+#             analyze_animation(obj)
+
+#         if not is_physics_enabled():
+#             enable_physics_visualization(True)
+#             register_physics_frame_handler()
+
+#         result = apply_trajectory_ik_assist(obj, context.scene.frame_current)
+#         moved = int(result.get("moved", 0) or 0)
+#         frame = result.get("frame")
+#         skipped = result.get("skipped", []) or []
+
+#         if moved <= 0:
+#             reason = ", ".join(str(item) for item in skipped[:3]) or "no applicable target"
+#             self.report({"WARNING"}, f"trajectory ik skipped: {reason}")
+#             return {"CANCELLED"}
+
+#         self.report({"INFO"}, f"trajectory ik keyed {moved} control(s) at frame {frame}")
+#         return {"FINISHED"}
+
+
+# class OBJECT_OT_ToggleRotationMomentum(bpy.types.Operator):
+#     """Toggle rotation-based momentum visualization"""
+#     bl_label = "Toggle Rotation Momentum"
+#     bl_idname = "object.rbxanims_toggle_rotation_momentum"
+#     bl_description = "Toggle the angular momentum / rotation visualization"
+#     bl_options = {'REGISTER'}
+
+#     @classmethod
+#     def poll(cls, context):
+#         obj = context.active_object
+#         return obj and obj.type == "ARMATURE"
+
+#     def execute(self, context):
+#         from ..rig.physics import toggle_angular_momentum, is_angular_momentum_enabled
         
-        toggle_angular_momentum()
-        state = "enabled" if is_angular_momentum_enabled() else "disabled"
-        self.report({"INFO"}, f"Rotation momentum {state}")
+#         toggle_angular_momentum()
+#         state = "enabled" if is_angular_momentum_enabled() else "disabled"
+#         self.report({"INFO"}, f"Rotation momentum {state}")
         
-        return {"FINISHED"}
+#         return {"FINISHED"}
 
 
 class OBJECT_OT_ToggleWeldBones(bpy.types.Operator):

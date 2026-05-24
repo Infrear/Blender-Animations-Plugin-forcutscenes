@@ -82,7 +82,7 @@ function BlenderConnection:ListArmatures(port: number)
 	return data.armatures
 end
 
-function BlenderConnection:ImportAnimation(port: number, armatureName: string)
+function BlenderConnection:ImportAnimation(port: number, armatureName: string, targetBoneRest: any?)
 	if type(port) ~= "number" or port <= 0 then
 		warn("Invalid port for ImportAnimation")
 		return nil
@@ -93,13 +93,29 @@ function BlenderConnection:ImportAnimation(port: number, armatureName: string)
 	end
 
 	local success, response = pcall(function()
-		local url = string.format("http://localhost:%d/export_animation/%s", port, armatureName)
+		local url = string.format("http://localhost:%d/export_animation/%s", port, self.HttpService:UrlEncode(armatureName))
+		if targetBoneRest then
+			return self.HttpService:RequestAsync({
+				Url = url,
+				Method = "POST" :: HttpMethod,
+				Body = self.HttpService:JSONEncode({
+					target_bone_rest = targetBoneRest,
+				}),
+				Headers = {
+					["Accept"] = "application/octet-stream",
+					["Content-Type"] = "application/json",
+				},
+				Compress = Enum.HttpCompression.None,
+			})
+		end
+
 		return self.HttpService:RequestAsync({
 			Url = url,
 			Method = "GET" :: HttpMethod,
 			Body = nil,
 			Headers = {
 				["Accept"] = "application/octet-stream",
+				["Content-Type"] = "application/json",
 			},
 			Compress = Enum.HttpCompression.None,
 		})
