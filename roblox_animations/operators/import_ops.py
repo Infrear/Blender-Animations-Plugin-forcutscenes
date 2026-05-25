@@ -2392,6 +2392,7 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
         from ..core.utils import cf_to_mat
         from ..rig.creation import (
             load_rigbone,
+            _collect_all_bone_names,
             _build_match_context,
             _safe_mode_set,
         )
@@ -3046,10 +3047,11 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
 
             # ---- Build weapon bones via load_rigbone (same as rig import) ----
             rigging_type = "RAW"
+            all_bone_names = _collect_all_bone_names(joints_tree)
             try:
                 load_rigbone(
                     armature, rigging_type, joints_tree,
-                    parent_edit_bone, target_coll, match_ctx,
+                    parent_edit_bone, target_coll, match_ctx, all_bone_names,
                 )
             except Exception as e:
                 import traceback
