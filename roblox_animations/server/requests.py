@@ -21,7 +21,6 @@ from ..animation.serialization import (
     serialize,
     is_deform_bone_rig,
     resolve_export_frame_range,
-    sync_scene_frame_range_to_export_source,
 )
 from ..animation.import_export import import_animation_preserve_ik
 
@@ -272,21 +271,11 @@ def execute_in_main_thread(task_id, armature_name, target_bone_rest=None):
                 getattr(timeline_scene, "frame_step", original_frame_step) or 1
             )
 
-        # Sync the scene frame range to the actual animation data so the
-        # exported duration matches the current animation (not a leftover range
-        # from a previously imported/ longer animation).
-        synced_range = sync_scene_frame_range_to_export_source(context_scene, ao)
-
         serialized = None
         try:
             serialized = serialize(ao, target_bone_rest=target_bone_rest)
         finally:
             if changed_scene_timeline:
-                context_scene.frame_start = original_frame_start
-                context_scene.frame_end = original_frame_end
-                context_scene.frame_step = original_frame_step
-            elif synced_range is not None:
-                # Restore the original frame range if we synced it
                 context_scene.frame_start = original_frame_start
                 context_scene.frame_end = original_frame_end
                 context_scene.frame_step = original_frame_step
