@@ -1099,12 +1099,9 @@ def _action_keyframe_range(
     return _frame_range_from_fcurves(fcurves)
 
 
-def resolve_export_frame_range(ao: "bpy.types.Object") -> Optional[Tuple[int, int]]:
-    """Return the frame range for the armature's current export source."""
-    animation_data = getattr(ao, "animation_data", None)
+def _animation_data_frame_range(animation_data: Any) -> Optional[Tuple[int, int]]:
     if animation_data is None:
         return None
-
     if getattr(animation_data, "use_nla", False):
         strip_ranges: List[Tuple[float, float]] = []
         for track in getattr(animation_data, "nla_tracks", []) or []:
@@ -1125,6 +1122,53 @@ def resolve_export_frame_range(ao: "bpy.types.Object") -> Optional[Tuple[int, in
     return _action_keyframe_range(
         animation_data,
         getattr(animation_data, "action", None),
+    )
+
+
+def _constraint_target_frame_ranges(
+    ao: "bpy.types.Object",
+) -> List[Tuple[int, int]]:
+    ranges: List[Tuple[int, int]] = []
+    if not ao or getattr(ao, "type", None) != "ARMATURE":
+        return ranges
+
+    seen_targets: Set[int] = set()
+    for bone in getattr(ao.pose, "bones", []) or []:
+        for constraint in getattr(bone, "constraints", []) or []:
+            target = getattr(constraint, "target", None)
+            if target is None or target == ao:
+                continue
+            if getattr(target, "type", None) != "ARMATURE":
+                continue
+            target_id = id(target)
+            if target_id in seen_targets:
+                continue
+            seen_targets.add(target_id)
+
+            frame_range = _animation_data_frame_range(
+                getattr(target, "animation_data", None)
+            )
+            if frame_range is not None:
+                ranges.append(frame_range)
+
+    return ranges
+
+
+def resolve_export_frame_range(ao: "bpy.types.Object") -> Optional[Tuple[int, int]]:
+    """Return the frame range for the armature's current export source."""
+    ranges: List[Tuple[int, int]] = []
+
+    own_range = _animation_data_frame_range(getattr(ao, "animation_data", None))
+    if own_range is not None:
+        ranges.append(own_range)
+
+    ranges.extend(_constraint_target_frame_ranges(ao))
+
+    if not ranges:
+        return None
+
+    return min(frame_range[0] for frame_range in ranges), max(
+        frame_range[1] for frame_range in ranges
     )
 
 
@@ -1260,13 +1304,23 @@ def serialize(
     # consider constraints only if they actually affect bones (ik chains, copy, etc.)
     has_constraints = len(get_all_constrained_bones(ao)) > 0
     has_drivers = len(get_all_driven_bones(ao)) > 0
+    has_constraint_target_action = any(
+        getattr(getattr(constraint, "target", None), "animation_data", None)
+        and getattr(constraint.target.animation_data, "action", None)
+        for bone in ao.pose.bones
+        for constraint in bone.constraints
+    )
 
     # --- Removed force_full_bake for new bones - use sparse baking instead ---
 
-    # If NLA tracks are active OR if there are constraints without a local action
-    # on the armature, we must do a simple, full bake of the visual result.
-    # This correctly handles "puppet" rigs driven entirely by other objects.
-    if use_nla_bake or (has_constraints and not action) or (has_drivers and not action):
+    # If NLA tracks are active OR if there are constraints without any keyed
+    # source action, use a simple full bake of the visual result. Constraint
+    # target actions can use the hybrid baker so their easing is preserved.
+    if (
+        use_nla_bake
+        or (has_constraints and not action and not has_constraint_target_action)
+        or (has_drivers and not action)
+    ):
         if use_nla_bake:
             pass
         else:
@@ -1341,8 +1395,8 @@ def serialize(
         result = {"t": (frames - 1) / desired_fps, "kfs": collected}
 
     # If there's an action, use the intelligent hybrid baker.
-    # This now correctly handles the case where an action AND constraints are present.
-    elif action:
+    # This also handles proxy rigs whose animation lives on constraint targets.
+    elif action or has_constraint_target_action:
         # 1. Identify Bone Groups and all relevant Actions
         constrained_bones = get_all_constrained_bones(ao)
         driven_bones = get_all_driven_bones(ao)
