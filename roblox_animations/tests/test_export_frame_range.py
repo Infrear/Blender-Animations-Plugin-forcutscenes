@@ -68,6 +68,40 @@ class TestExportFrameRange(unittest.TestCase):
             return channelbag.fcurves.new(data_path, index=index)
         return action.fcurves.new(data_path=data_path, index=index)
 
+    def _make_export_armature_without_action(self, name):
+        if bpy.context.object and bpy.context.object.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = name
+
+        if "Root" not in armature_obj.data.edit_bones:
+            bone = armature_obj.data.edit_bones.new("Root")
+            bone.head = (0, 0, 0)
+            bone.tail = (0, 0, 1)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        pose_bone = armature_obj.pose.bones["Root"]
+        pose_bone.bone["transform"] = [1, 0, 0, 0, 1, 0, 0, 0, 1]
+        pose_bone.bone["transform1"] = [1, 0, 0, 0, 1, 0, 0, 0, 1]
+        pose_bone.bone["nicetransform"] = [1, 0, 0, 0, 1, 0, 0, 0, 1]
+
+        return armature_obj
+
+    def _add_copy_location_constraint(self, driven_armature, target_armature):
+        bpy.context.view_layer.objects.active = driven_armature
+        if driven_armature.mode != "POSE":
+            bpy.ops.object.mode_set(mode="POSE")
+
+        pose_bone = driven_armature.pose.bones["Root"]
+        constraint = pose_bone.constraints.new(type="COPY_LOCATION")
+        constraint.target = target_armature
+        constraint.subtarget = "Root"
+        constraint.owner_space = "WORLD"
+        constraint.target_space = "WORLD"
+        return constraint
+
     def test_export_range_sync_uses_new_action_after_file_switch(self):
         armature_obj = self._make_armature_with_action("First", (1, 44))
         scene = bpy.context.scene
@@ -94,6 +128,24 @@ class TestExportFrameRange(unittest.TestCase):
         self.assertEqual(resolved, (8, 12))
         self.assertEqual(scene.frame_start, 8)
         self.assertEqual(scene.frame_end, 12)
+
+    def test_export_range_uses_constraint_target_action_for_proxy_rig(self):
+        control_armature = self._make_armature_with_action("Control", (6, 38))
+        export_armature = self._make_export_armature_without_action("__Rig")
+        self._add_copy_location_constraint(export_armature, control_armature)
+
+        scene = bpy.context.scene
+        scene.frame_start = 1
+        scene.frame_end = 120
+
+        resolved = serialization.sync_scene_frame_range_to_export_source(
+            scene,
+            export_armature,
+        )
+
+        self.assertEqual(resolved, (6, 38))
+        self.assertEqual(scene.frame_start, 6)
+        self.assertEqual(scene.frame_end, 38)
 
     def test_server_export_uses_active_action_range_each_time(self):
         armature_obj = self._make_armature_with_action("ActionA", (1, 90))

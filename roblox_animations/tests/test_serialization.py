@@ -1862,7 +1862,7 @@ class TestAnimationSerialization(unittest.TestCase):
         master_pose_bone.keyframe_insert(data_path="location", frame=1)
         master_pose_bone.location = (5, 0, 0)
         master_pose_bone.keyframe_insert(data_path="location", frame=20)
-        self.set_action_interpolation(master_action, "LINEAR")
+        self.set_action_interpolation(master_action, "CONSTANT")
 
         # 2. Create Puppet Rig (the one we will export)
         bpy.ops.object.mode_set(mode="OBJECT")
@@ -1907,11 +1907,15 @@ class TestAnimationSerialization(unittest.TestCase):
         # --- ASSERTION ---
         self.assertTrue(result, "Serialization returned no result for puppet rig test.")
         keyframes = result["kfs"]
-        self.assertEqual(
-            len(keyframes), 20, "Expected a full 20 frames for a puppet rig."
+        self.assertGreaterEqual(
+            len(keyframes), 2, "Expected keyframes for the constrained puppet rig."
         )
+        self.assertAlmostEqual(keyframes[0]["t"], 0.0, places=4)
+        self.assertAlmostEqual(keyframes[-1]["t"], 19 / utils.get_scene_fps(), places=4)
 
-        # Check that the bone was actually baked and has non-identity transforms
+        # Check that the bone was actually exported and has non-identity transforms.
+        # Constraint-target actions use the hybrid baker, so CONSTANT interpolation
+        # can export sparsely instead of baking every frame.
         last_frame_kf = keyframes[-1]["kf"]
         self.assertIn(
             "PuppetBone", last_frame_kf, "PuppetBone not found in the last keyframe."
@@ -1925,6 +1929,11 @@ class TestAnimationSerialization(unittest.TestCase):
         )
         self.assertEqual(
             len(puppet_bone_data), 3, "Puppet bone data should have 3 elements."
+        )
+        self.assertEqual(
+            puppet_bone_data[1],
+            "Constant",
+            "External constraint target CONSTANT interpolation should be preserved.",
         )
 
         cframe_components = puppet_bone_data[0]

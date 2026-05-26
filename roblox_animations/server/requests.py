@@ -20,6 +20,7 @@ from ..core import utils
 from ..animation.serialization import (
     serialize,
     is_deform_bone_rig,
+    resolve_export_frame_range,
     sync_scene_frame_range_to_export_source,
 )
 from ..animation.import_export import import_animation_preserve_ik
@@ -246,19 +247,10 @@ def execute_in_main_thread(task_id, armature_name, target_bone_rest=None):
             )
             return
 
-        animation_data = getattr(ao, "animation_data", None)
-        has_action = animation_data is not None and animation_data.action is not None
-        has_nla = animation_data is not None and animation_data.use_nla
-        if has_nla:
-            # Check if any NLA tracks have unmuted strips
-            has_nla = any(
-                not track.mute and any(True for _ in track.strips)
-                for track in animation_data.nla_tracks
-            )
-        if not has_action and not has_nla:
+        if resolve_export_frame_range(ao) is None:
             pending_responses[task_id] = (
                 False,
-                f"No animation data found on '{armature_name}'. Please add keyframes or NLA strips.",
+                f"No animation data found on '{armature_name}' or its constraint targets. Please add keyframes or NLA strips.",
             )
             return
         # --- End pre-export validations ---
