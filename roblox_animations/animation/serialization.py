@@ -1970,9 +1970,17 @@ def serialize(
         bezier_dense_frames = set()
         for bone_segs in bezier_segments.values():
             for seg_start, seg_end in bone_segs:
-                bezier_dense_frames.update(range(seg_start + 1, seg_end))
+                bezier_dense_frames.update(
+                    frame
+                    for frame in range(seg_start + 1, seg_end)
+                    if frame_start <= frame <= frame_end
+                )
         if subframe_keys or bezier_dense_frames:
-            all_frames_to_bake = sorted(set(base_frames).union(subframe_keys).union(bezier_dense_frames))
+            all_frames_to_bake = sorted(
+                frame
+                for frame in set(base_frames).union(subframe_keys).union(bezier_dense_frames)
+                if frame_start <= frame <= frame_end
+            )
         else:
             all_frames_to_bake = base_frames
 
