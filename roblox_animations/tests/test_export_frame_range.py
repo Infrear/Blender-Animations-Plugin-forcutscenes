@@ -147,9 +147,9 @@ class TestExportFrameRange(unittest.TestCase):
         self.assertEqual(scene.frame_start, 6)
         self.assertEqual(scene.frame_end, 38)
 
-    def test_server_export_uses_active_action_range_each_time(self):
+    def test_server_export_respects_scene_frame_range_each_time(self):
         armature_obj = self._make_armature_with_action("ActionA", (1, 90))
-        scene = bpy.context.scene
+        scene = bpy.data.scenes.get("Scene") or bpy.context.scene
 
         action_b = bpy.data.actions.new("ActionB")
         fcurve_b = self._new_action_fcurve(
@@ -188,13 +188,13 @@ class TestExportFrameRange(unittest.TestCase):
         self.assertEqual((a_start, a_end), (1, 90))
 
         b_start, b_end = export_with_scene_range(action_b, 90, "task_b")
-        self.assertEqual((b_start, b_end), (1, 45))
+        self.assertEqual((b_start, b_end), (1, 90))
 
         c_start, c_end = export_with_scene_range(action_c, 45, "task_c")
-        self.assertEqual((c_start, c_end), (1, 100))
+        self.assertEqual((c_start, c_end), (1, 45))
 
         b2_start, b2_end = export_with_scene_range(action_b, 100, "task_b2")
-        self.assertEqual((b2_start, b2_end), (1, 45))
+        self.assertEqual((b2_start, b2_end), (1, 100))
 
 
 if __name__ == "__main__":
