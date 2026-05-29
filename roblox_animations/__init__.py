@@ -26,7 +26,7 @@ bl_info = {
     "name": "Roblox Animations Importer/Exporter",
     "description": "Plugin for importing roblox rigs and exporting animations.",
     "author": "Cautioned",
-    "version": (2, 6, 2),
+    "version": (2, 6, 3),
     "blender": (2, 80, 0),
     "location": "View3D > Toolbar",
 }
