@@ -727,6 +727,7 @@ function Rig:LoadAnimation(data, progressCallback: LoadProgressCallback?)
 	end
 
 	self.animTime = data.t * timeScale
+	self.exportFPS = (timeScale ~= 1) and (1 / timeScale) or nil -- preserve source fps for CutscenePipeline
 	self.faceControls = {}
 
 	local totalPoseEntries = 0

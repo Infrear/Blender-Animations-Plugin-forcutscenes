@@ -1157,6 +1157,11 @@ function AnimationManager:saveAnimationRig()
 
 	kfs.Parent = animSaves
 
+	-- store source fps for CutscenePipeline frame-to-time conversion
+	if State.activeRig and State.activeRig.exportFPS then
+		kfs:SetAttribute("SourceFPS", State.activeRig.exportFPS)
+	end
+
 	if State.rigManager and State.rigManager.updateSavedAnimationsList then
 		State.rigManager:updateSavedAnimationsList()
 	end
