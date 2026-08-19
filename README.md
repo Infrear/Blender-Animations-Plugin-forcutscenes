@@ -1,34 +1,54 @@
-# Blender Animations Plugin for Roblox
+# roblox headless ai animation pipeline (azul edition)
+
+A tuff ass programmatic animation pipeline for roblox studio. basically lets you use AI thru the mcp or your own scripts to automatically add frame-based markers and upload animations directly to roblox, completely bypassing the manual ui.
+
+oh yeah and this project is built on top of a fork of the Blender-to-Roblox animation importer by cautioned, basically adding a headless orchestration layer.
+
+> [!NOTE]
+> **just looking for the AI orchestration module without the blender plugin?**
+> check out the [standalone ai cutscene pipeline](https://github.com/Infrear/roblox-ai-cutscene-pipeline?tab=readme-ov-file) repository which is released under a MIT license.
+
+## how it works
+
+instead of manually adding markers in seconds or clicking through the roblox upload dialog, this pipeline lets an AI (or your own scripts) do the heavy lifting:
+
+1. **import:** you import an animation from blender using the included plugin. the plugin captures your blender framerate and stores it directly on the animation as a `SourceFPS` attribute.
+2. **author events (frame-based):** you tell your AI agent what markers to add at which **frames** (for example: "add 'FadeIn' at frame 90"), and the pipeline converts the frame accurately to seconds based on the original framerate.
+3. **headless upload:** the pipeline programmatically uploads the animation using the modern `CreateAssetAsync` (and updates via `CreateAssetVersionAsync`), skipping the manual upload dialog entirely and returning the asset ID.
+
+## requirements & installation
+
+1. **roblox studio:** as of august 2026, im pretty sure you gotta have the "Lua Asset Creation" beta feature enabled in studio for `CreateAssetAsync` to function properly.
+2. **blender setup:** install the blender addon from the original creator's [github releases](https://github.com/cautioned/blender-animations-plugin/releases).
+3. **roblox syncing (azul):** this project is structured for **azul**. sync it directly into your place by running:
+   ```bash
+   azul --sync-dir ./
+   ```
+4. **mcp server:** to drive the pipeline via AI, you need an mcp server running locally with `execute_luau` capabilities to inject commands directly into your active studio window.
+
+## usage (ai orchestration)
+
+once the plugin is installed and an animation is saved to `AnimSaves`, your AI agent can execute commands like this via `execute_luau`:
+
+```lua
+local CIP = require(game.ServerScriptService.BlenderAnimationsInternal.Services.CutscenePipeline)
+
+-- add an event at frame 90
+CIP:addEvent("Camera Wake Up", "FadeIn", 90)
+
+-- upload and get the Asset ID automatically
+local assetId, err = CIP:upload("Camera Wake Up")
+print("uploaded to:", assetId)
+```
+
+---
+
+# original plugin info
+*the following is preserved from the original Blender Animations Plugin by yaboi cautioned.*
 
 A powerful Roblox Studio plugin that enables seamless animation workflow between Blender and Roblox, featuring real-time sync, advanced rigging tools, and comprehensive animation management.
 
-## Installation
-
-1. Download the latest release from [Blender Extensions](https://extensions.blender.org/approval-queue/roblox-animations-importer-exporter/) or [Releases](https://github.com/cautioned/blender-animations-plugin/releases) page
-2. Install the plugin on Roblox Studio: [Get Here](https://create.roblox.com/store/asset/16708835782/Blender-Animations-ultimate-edition)
-3. Set up the Blender addon (see Blender Setup below)
-
-## Blender Setup
-
-1. Install the Blender addon in blender's preferences (download zip) [Blender Extensions](https://extensions.blender.org/approval-queue/roblox-animations-importer-exporter/) or [Releases](https://github.com/cautioned/blender-animations-plugin/releases) page
-2. Install the Roblox addon: https://create.roblox.com/store/asset/16708835782/
-2. Enable the addon in Blender's preferences
-3. The addon is found in the 3D view toolbar press 'N' then click the 'Rbx Animations' tab
-4. Start the Blender server on port 31337 (default), or your port of choice. 
-5. Connect to the server using the Blender Sync tab on the Roblox Plugin.
-
-## Usage
-
-### Basic Workflow
-
-1. **Connect to Blender**: Use the "Blender Sync" tab
-2. **Select a Rig**: Choose your armature in the Blender Sync tab
-3. **Import Animation**: Click "Import from Blender" to bring animations into Roblox
-4. **Play & Edit**: Use the playback controls to preview and edit animations
-5. **Export Back**: Send animations back to Blender for further editing
-
 ### Features
-
 - **Live Sync**: Enable live sync for real-time updates between Blender and Roblox
 - **Bone Sync**: Create bones in Blender and sync them in studio as motor6ds.
 - **Bone Toggles**: Use the Tools tab to enable/disable specific bones
@@ -36,39 +56,5 @@ A powerful Roblox Studio plugin that enables seamless animation workflow between
 - **Camera Controls**: Attach a camera to a part, such as the head. Useful for viewport animations.
 - **Easing Transfer**: Easing transfers losslessly between Roblox and Blender where possible.
 
-## Configuration
-
-### Plugin Settings
-- **Auto-connect**: Automatically connect to Blender on startup
-- **Live Sync**: Enable real-time synchronization
-- **File Export**: Allow exporting animations to files
-
-## Troubleshooting
-
-### Common Issues
-
-**Connection Failed**
-- Ensure Blender server is running on the correct port
-- Roblox plugin must have network permissions enabled.
-- Check firewall settings
-- Verify the Blender addon is properly installed
-
-
-## Contributing
-
-1. Test for stability and submit a pull request.
-
-## License
-
-This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
-
-**Important**: This software is forever free and open source. Commercial use is permitted under the GPL-3.0 license, but any derivative works must also be open source and free. This prevents proprietary monetization while allowing donations and community contributions. DO NOT reupload this to the Roblox Creator Store as a paid plugin (free with donations is allowed however). If you disagree with this practice, you may program your own version based off the original addon by Den_S https://devforum.roblox.com/t/blender-rig-exporteranimation-importer/34729, which has no such copyleft restrictions.
-
-## Support
-
-- **Issues**: Report bugs and request features on [GitHub Issues](https://github.com/cautioned/blender-animations-plugin/issues)
-- **Discord**: Join the discord server for help: [JOIN HERE](https://discord.gg/qNB3EhxYYp)
-
----
-
-**Made with ❤️ for the Roblox and Blender communities**
+### License
+This project is licensed under the GNU General Public License v3.0 - see the LICENSE file for details.
