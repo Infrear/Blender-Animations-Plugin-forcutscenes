@@ -59,6 +59,41 @@ function KeyframeNaming.createKeyframeNamingUI(services: any, layoutOrder: numbe
 				Text = "Insert Animation Event (marker), or Name Keyframe",
 				LayoutOrder = 1,
 			}),
+			New("Frame")({
+				Size = UDim2.new(1, 0, 0, 22),
+				LayoutOrder = 1.5,
+				BackgroundTransparency = 1,
+				[Children] = {
+					TextInput({
+						PlaceholderText = "Target Frame (e.g. 120)",
+						Size = UDim2.new(0.7, -4, 1, 0),
+						Text = State.jumpFrameInput or Value(""),
+						[OnChange("Text")] = function(newText)
+							if not State.jumpFrameInput then
+								State.jumpFrameInput = Value("")
+							end
+							State.jumpFrameInput:set(newText)
+						end,
+					}),
+					Button({
+						Text = "Jump",
+						Size = UDim2.new(0.3, 0, 1, 0),
+						Position = UDim2.new(0.7, 4, 0, 0),
+						Activated = function()
+							if State.jumpFrameInput then
+								local num = tonumber(State.jumpFrameInput:get())
+								if num then
+									local targetTime = num / 60
+									State.playhead:set(targetTime)
+									if State.currentAnimTrack then
+										State.currentAnimTrack.TimePosition = targetTime
+									end
+								end
+							end
+						end :: (() -> nil)?,
+					}),
+				},
+			}) :: any,
 			Dropdown({
 				Options = { "Name", "Event" },
 				Value = State.keyframeMarkerType,

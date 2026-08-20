@@ -17,6 +17,7 @@ local Checkbox = require(StudioComponents.Checkbox)
 local Label = require(StudioComponents.Label)
 local TextInput = require(StudioComponents.TextInput)
 local VerticalCollapsibleSection = require(StudioComponents.VerticalCollapsibleSection)
+local Button = require(StudioComponents.Button)
 
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
 local _themeProvider = require(StudioComponentsUtil.themeProvider)
@@ -285,6 +286,35 @@ function MoreTab.create(services: any)
 			TextTransparency = 0,
 			RichText = true,
 		}),
+		VerticalCollapsibleSection({
+			Text = "Utilities",
+			Collapsed = false,
+			LayoutOrder = 4.5,
+			[Children] = {
+				Button({
+					Text = "Clear Animation Objects",
+					Size = UDim2.new(1, 0, 0, 24),
+					LayoutOrder = 1,
+					Activated = function()
+						local rig = State.activeRigModel
+						if rig then
+							local animSaves = rig:FindFirstChild("AnimSaves")
+							if animSaves then
+								animSaves:Destroy()
+							end
+							local humanoid = rig:FindFirstChildOfClass("Humanoid")
+							local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
+							if animator then
+								for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+									track:Stop()
+									track:Destroy()
+								end
+							end
+						end
+					end :: (() -> nil)?,
+				}),
+			},
+		}) :: any,
 		VerticalCollapsibleSection({
 			Text = "About",
 			Collapsed = false,

@@ -1,0 +1,10 @@
+{
+  "name": "BlenderAnimationsAI",
+  "tree": {
+    "$className": "Folder",
+    "BlenderAnimationsInternal": {
+      "$className": "Folder",
+      "$path": "ServerScriptService/BlenderAnimationsInternal"
+    }
+  }
+}
