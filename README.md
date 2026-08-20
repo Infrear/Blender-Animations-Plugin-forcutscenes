@@ -16,15 +16,26 @@ instead of manually adding markers in seconds or clicking through the roblox upl
 2. **author events (frame-based):** you tell your AI agent what markers to add at which **frames** (for example: "add 'FadeIn' at frame 90"), and the pipeline converts the frame accurately to seconds based on the original framerate.
 3. **headless upload:** the pipeline programmatically uploads the animation using the modern `CreateAssetAsync` (and updates via `CreateAssetVersionAsync`), skipping the manual upload dialog entirely and returning the asset ID.
 
-## requirements & installation
+## installation (for regular users)
+
+if you just want to install the plugin and get going, you don't need any command line tools at all:
+1. download the `BlenderAnimationsAI.rbxmx` file from the github releases.
+2. open your plugins folder in roblox studio and just drop the file in there. that's literally it!
+
+## installation (for developers)
+
+if you want to mess with the code and push your own updates, here's how you install the source:
 
 1. **roblox studio:** as of august 2026, im pretty sure you gotta have the "Lua Asset Creation" beta feature enabled in studio for `CreateAssetAsync` to function properly.
 2. **blender setup:** install the blender addon from the original creator's [github releases](https://github.com/cautioned/blender-animations-plugin/releases).
-3. **roblox syncing (azul):** this project is structured for **azul**. sync it directly into your place by running:
-   ```bash
-   azul --sync-dir ./
-   ```
-4. **mcp server:** to drive the pipeline via AI, you need an mcp server running locally with `execute_luau` capabilities to inject commands directly into your active studio window.
+3. **roblox syncing:** this project is fully structured for both **azul** and **rojo**.
+   - if you're on azul, just sync it directly into your place by running:
+     ```bash
+     azul --sync-dir ./
+     ```
+   - if you're on rojo, there's a `default.project.json` ready for you to use.
+4. **building the plugin:** if you make changes and want to compile a fresh `.rbxmx` plugin file to release, just right-click the `build_roblox_plugin.ps1` file and hit "run with powershell". it automatically downloads the rojo compiler (if you don't have it), builds the plugin for you, and even drops it into your studio plugins folder automatically.
+5. **mcp server:** to drive the pipeline via AI, you need an mcp server running locally with `execute_luau` capabilities to inject commands directly into your active studio window.
 
 ## usage (ai orchestration)
 
